@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from kirby_flagged import FLAGGED_CSV_PATH, record_flagged
+from kirby_flagged import record_flagged
 from kirby_log import KirbyLogger
 from kirby_report import format_scan_report_header
 
@@ -43,8 +43,12 @@ RUN_SUBKEY_ENTRY_PATTERN = re.compile(r"^\s{2}(.+?)\s+->\s+(.+)$")
 SERVICE_IMAGEPATH_PATTERN = re.compile(r"^\s{2}ImagePath\s*=\s*(.+)$", re.IGNORECASE)
 SERVICE_NAME_PATTERN = re.compile(r"^\s{2}Name\s*=\s*(.+)$", re.IGNORECASE)
 USERASSIST_PATH_PATTERN = re.compile(
-    r"^(\s*)([A-Za-z]:\\[^\r\n]+?)(?:\s{2,}\d{4}-\d{2}-\d{2}|\s*$)",
+    r"^(\s*)([A-Za-z]:\\.+?)(?:\s+\(\d+\))?\s*$",
 )
+TRAILING_USERASSIST_COUNT = re.compile(r"\s+\(\d+\)$")
+TRAILING_TIMESTAMP = re.compile(r"\s{2,}\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?$")
+WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:\\", re.IGNORECASE)
+QUOTED_PATH = re.compile(r'^"\s*([^"]+?)\s*"')
 EXECUTABLE_PATTERN = re.compile(
     r"\.(?:exe|dll|bat|cmd|ps1|vbs|js|jse|wsf|wsh|scr|com|msi|hta|jar|lnk)\b",
     re.IGNORECASE,
@@ -241,27 +245,65 @@ def expand_windows_env(value: str) -> str:
     return expanded.strip().strip('"')
 
 
-def extract_executable(value: str) -> str | None:
+def strip_registry_path_metadata(value: str) -> str:
+    path = value.strip().strip('"\'')
+    path = TRAILING_USERASSIST_COUNT.sub("", path)
+    path = TRAILING_TIMESTAMP.sub("", path)
+    return path.strip()
+
+
+def normalize_windows_path_for_mount(path: str) -> str:
+    normalized = path.replace("/", "\\")
+    if normalized.casefold().startswith("\\\\?\\"):
+        return normalized[4:]
+    return normalized
+
+
+def extract_windows_path(value: str) -> str | None:
+    """Extract a Windows path from a registry value, alert line, or command string."""
     cleaned = expand_windows_env(value)
     if not cleaned:
         return None
 
-    token = cleaned.split()[0] if cleaned.split() else cleaned
-    token = token.strip('"\'')
-    if EXECUTABLE_PATTERN.search(token) or re.match(r"^[A-Za-z]:\\", token):
-        return token
+    quoted = QUOTED_PATH.match(cleaned)
+    if quoted:
+        candidate = strip_registry_path_metadata(quoted.group(1))
+        return candidate or None
+
+    cleaned = strip_registry_path_metadata(cleaned)
+    normalized = cleaned.replace("/", "\\")
+
+    drive_match = re.search(r"(?:\\\\\?\\)?([A-Za-z]:\\)", normalized, re.IGNORECASE)
+    if drive_match:
+        path_from_drive = normalize_windows_path_for_mount(normalized[drive_match.start() :])
+
+        ext_match = EXECUTABLE_PATTERN.search(path_from_drive)
+        if ext_match:
+            return path_from_drive[: ext_match.end()]
+
+        if WINDOWS_DRIVE_PATH.match(path_from_drive):
+            return path_from_drive
+
+    token = cleaned.split()[0].strip('"\'') if cleaned.split() else cleaned
+    token = strip_registry_path_metadata(token)
+    if EXECUTABLE_PATTERN.search(token) or WINDOWS_DRIVE_PATH.match(token):
+        return normalize_windows_path_for_mount(token)
     if SUSPICIOUS_LAUNCHER_PATTERN.search(cleaned):
         return cleaned
     return None
 
 
+def extract_executable(value: str) -> str | None:
+    return extract_windows_path(value)
+
+
 def resolve_target_path(raw_path: str, target: Path) -> Path | None:
-    candidate = extract_executable(raw_path)
+    candidate = extract_windows_path(raw_path)
     if not candidate:
         return None
 
-    normalized = candidate.replace("/", "\\")
-    if not re.match(r"^[A-Za-z]:\\", normalized):
+    normalized = normalize_windows_path_for_mount(candidate)
+    if not WINDOWS_DRIVE_PATH.match(normalized):
         return None
 
     rel = normalized[3:].replace("\\", "/")
@@ -283,27 +325,33 @@ def resolve_bare_windows_path(value: str, target: Path) -> Path | None:
     if resolved:
         return resolved
 
-    token = cleaned.split()[0].strip('"\'')
+    token = extract_windows_path(cleaned)
+    if not token:
+        return None
+    if WINDOWS_DRIVE_PATH.match(token):
+        return None
+
+    bare_name = token
     search_roots = (
         target / "Windows" / "System32",
         target / "Windows" / "SysWOW64",
         target / "Windows",
     )
 
-    if EXECUTABLE_PATTERN.search(token):
+    if EXECUTABLE_PATTERN.search(bare_name):
         for root in search_roots:
-            candidate = (root / token).resolve()
+            candidate = (root / bare_name).resolve()
             try:
                 candidate.relative_to(target.resolve())
             except ValueError:
                 continue
             if candidate.is_file():
                 return candidate
-        return (target / "Windows" / "System32" / token).resolve()
+        return (target / "Windows" / "System32" / bare_name).resolve()
 
     # Non-path shell tokens (e.g. Winlogon Shell value "0")
-    if re.fullmatch(r"[\w.-]+", token):
-        return (target / "Windows" / "System32" / token).resolve()
+    if re.fullmatch(r"[\w.-]+", bare_name):
+        return (target / "Windows" / "System32" / bare_name).resolve()
 
     return None
 
@@ -706,10 +754,15 @@ def run(
     config: Path,
     *,
     verbose: bool = True,
+    flagged_csv: Path | None = None,
+    file_list: Path | None = None,
 ) -> None:
     log = KirbyLogger(verbose, prefix="regripper")
     log.step(f"Loading config from {config}")
     settings = load_config(config)
+    flagged_csv_path = flagged_csv or (
+        file_list.parent / "flagged.csv" if file_list is not None else ROOT / "tmp" / "flagged.csv"
+    )
     categories = config_list(settings, "categories") or list(CATEGORY_TITLES)
 
     rip_pl = ensure_regripper(settings, log)
@@ -760,12 +813,17 @@ def run(
     filesystem_paths, registry_paths = collect_flagged_entries(findings)
     updated = 0
     if filesystem_paths:
-        updated += record_flagged(filesystem_paths, TOOL_NAME)
+        updated += record_flagged(filesystem_paths, TOOL_NAME, csv_path=flagged_csv_path)
     if registry_paths:
-        updated += record_flagged(registry_paths, TOOL_NAME, normalize=False)
+        updated += record_flagged(
+            registry_paths,
+            TOOL_NAME,
+            csv_path=flagged_csv_path,
+            normalize=False,
+        )
     if updated:
         log.step(
-            f"Updated {updated} path(s) in {FLAGGED_CSV_PATH} "
+            f"Updated {updated} path(s) in {flagged_csv_path} "
             f"({len(filesystem_paths)} file, {len(registry_paths)} registry)"
         )
 

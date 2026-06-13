@@ -7,9 +7,6 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from kirby_index import (
-    ALL_FILES_META_PATH,
-    ALL_FILES_PATH,
-    SHA256_HASHES_PATH,
     build_hash_cache_from_file_list,
     load_file_list_meta,
     publish_cached_file,
@@ -133,8 +130,9 @@ def is_kext_path(path_str: str) -> bool:
 
 
 def ensure_kext_file_list(
-    tmp_files_path: Path = ALL_FILES_PATH,
-    tmp_meta_path: Path = ALL_FILES_META_PATH,
+    tmp_files_path: Path,
+    tmp_meta_path: Path,
+    tmp_hashes_path: Path,
     log: KirbyLogger | None = None,
 ) -> int:
     if log is None:
@@ -157,7 +155,7 @@ def ensure_kext_file_list(
             KEXT_FILES_PATH,
             tmp_files_path,
             KEXT_HASHES_PATH,
-            SHA256_HASHES_PATH,
+            tmp_hashes_path,
             KEXT_META_PATH,
             tmp_meta_path,
         )
@@ -173,7 +171,7 @@ def ensure_kext_file_list(
         KEXT_FILES_PATH,
         tmp_files_path,
         KEXT_HASHES_PATH,
-        SHA256_HASHES_PATH,
+        tmp_hashes_path,
         KEXT_META_PATH,
         tmp_meta_path,
     )

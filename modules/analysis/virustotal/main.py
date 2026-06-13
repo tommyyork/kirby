@@ -92,8 +92,10 @@ def sha256_file(path: Path) -> str:
 def hash_files(
     files: list[tuple[Path, list[str], str]],
     log: KirbyLogger,
+    *,
+    sha256_hashes_path: Path,
 ) -> list[tuple[Path, list[str], str]]:
-    hash_cache = load_hash_cache()
+    hash_cache = load_hash_cache(sha256_hashes_path)
     hashed: list[tuple[Path, list[str], str]] = []
     from_csv = 0
     from_cache = 0
@@ -444,24 +446,34 @@ def run(
     *,
     verbose: bool = True,
     flagged_csv: Path | None = None,
+    hashes_output: Path | None = None,
+    file_list: Path | None = None,
 ) -> None:
     log = KirbyLogger(verbose, prefix="virustotal")
     log.step(f"Loading config from {config}")
     settings = load_config(config)
 
     flagged_csv_path = flagged_csv or project_path(settings, "flagged_csv")
-    hashes_path = project_path(settings, "hashes_output")
+    hashes_path = hashes_output or project_path(settings, "hashes_output")
+    sha256_hashes_path = (
+        file_list.parent / "sha256_hashes"
+        if file_list is not None
+        else flagged_csv_path.parent / "sha256_hashes"
+    )
     cache_path = project_path(settings, "cache_db")
     delay_seconds = settings.getfloat(CONFIG_SECTION, "api_delay_seconds", fallback=15.0)
     api_key = virustotal_api_key()
 
     flagged_files = read_flagged_files(flagged_csv_path, log)
     if flagged_csv is None:
-        backfilled = backfill_flagged_hashes(flagged_csv_path)
+        backfilled = backfill_flagged_hashes(
+            flagged_csv_path,
+            hashes_path=sha256_hashes_path,
+        )
         if backfilled:
             log.step(f"Backfilled {backfilled} SHA-256 hash(es) in {flagged_csv_path}")
             flagged_files = read_flagged_files(flagged_csv_path, log)
-    hashed = hash_files(flagged_files, log)
+    hashed = hash_files(flagged_files, log, sha256_hashes_path=sha256_hashes_path)
     write_hashes_file(hashed, hashes_path, log)
 
     connection = init_cache(cache_path)

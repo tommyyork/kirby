@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from kirby_flagged import FLAGGED_CSV_PATH, record_flagged
+from kirby_flagged import record_flagged
 from kirby_kext import is_kext_target, kext_search_roots
 from kirby_log import KirbyLogger
 from kirby_report import format_scan_report_header
@@ -261,6 +261,8 @@ def run(
     config: Path,
     *,
     verbose: bool = True,
+    flagged_csv: Path | None = None,
+    file_list: Path | None = None,
 ) -> None:
     log = KirbyLogger(verbose, prefix="yara")
     log.step(f"Loading config from {config}")
@@ -274,6 +276,13 @@ def run(
     if is_kext_target(target):
         log.step("Scanning kernel extension directories")
         matches, stderr, _returncode = run_yara_kext(compiled, recursive, log)
+    elif target.is_file():
+        log.step("Scanning single file target")
+        result = run_yara(compiled, target, recursive=False, log)
+        if result.returncode not in (0, 1):
+            raise RuntimeError(result.stderr.strip() or f"yara exited with code {result.returncode}")
+        matches = parse_matches(result.stdout)
+        stderr = result.stderr
     else:
         result = run_yara(compiled, target, recursive, log)
         if result.returncode not in (0, 1):
@@ -289,9 +298,13 @@ def run(
         log.flag(f"{filepath} — rule `{rule}`")
 
     flagged_paths = sorted({filepath for _, filepath in matches})
+    flagged_csv_path = flagged_csv or (
+        file_list.parent / "flagged.csv" if file_list is not None else ROOT / "tmp" / "flagged.csv"
+    )
+
     if flagged_paths:
-        updated = record_flagged(flagged_paths, TOOL_NAME)
-        log.step(f"Updated {updated} path(s) in {FLAGGED_CSV_PATH}")
+        updated = record_flagged(flagged_paths, TOOL_NAME, csv_path=flagged_csv_path)
+        log.step(f"Updated {updated} path(s) in {flagged_csv_path}")
 
     report = format_report(
         target=target,

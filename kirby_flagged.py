@@ -11,8 +11,6 @@ from kirby_kext import is_kext_path, is_kext_target
 from kirby_target import resolve_flagged_filter_root
 
 ROOT = Path(__file__).resolve().parent
-FLAGGED_CSV_PATH = ROOT / "tmp" / "flagged.csv"
-FLAGGED_SCOPED_CSV_PATH = ROOT / "tmp" / "flagged-scoped.csv"
 FlaggedEntry = tuple[list[str], str]
 
 
@@ -20,7 +18,7 @@ def _normalize_path(path: str | Path) -> str:
     return str(Path(path).resolve())
 
 
-def load_flagged(csv_path: Path = FLAGGED_CSV_PATH) -> dict[str, FlaggedEntry]:
+def load_flagged(csv_path: Path) -> dict[str, FlaggedEntry]:
     if not csv_path.is_file():
         return {}
 
@@ -37,7 +35,7 @@ def load_flagged(csv_path: Path = FLAGGED_CSV_PATH) -> dict[str, FlaggedEntry]:
     return flagged
 
 
-def save_flagged(flagged: dict[str, FlaggedEntry], csv_path: Path = FLAGGED_CSV_PATH) -> None:
+def save_flagged(flagged: dict[str, FlaggedEntry], csv_path: Path) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -49,7 +47,7 @@ def record_flagged(
     paths: Iterable[str | Path],
     tool: str,
     *,
-    csv_path: Path = FLAGGED_CSV_PATH,
+    csv_path: Path,
     normalize: bool = True,
 ) -> int:
     """Register files flagged by a scan tool.
@@ -64,7 +62,7 @@ def record_flagged(
     if not normalized_tool:
         raise ValueError("tool name must not be empty")
 
-    hash_cache = load_hash_cache() if normalize else {}
+    hash_cache = load_hash_cache(csv_path.parent / "sha256_hashes") if normalize else {}
     flagged = load_flagged(csv_path)
     updated = 0
 
@@ -93,9 +91,13 @@ def record_flagged(
     return updated
 
 
-def backfill_flagged_hashes(csv_path: Path = FLAGGED_CSV_PATH) -> int:
-    """Fill missing SHA-256 values in flagged.csv from tmp/sha256_hashes."""
-    hash_cache = load_hash_cache()
+def backfill_flagged_hashes(
+    csv_path: Path,
+    *,
+    hashes_path: Path | None = None,
+) -> int:
+    """Fill missing SHA-256 values in flagged.csv from the per-target hash cache."""
+    hash_cache = load_hash_cache(hashes_path or csv_path.parent / "sha256_hashes")
     flagged = load_flagged(csv_path)
     updated = 0
 
@@ -124,6 +126,8 @@ def is_flagged_path_under_target(path_str: str, target_root: Path) -> bool:
     try:
         path = Path(path_str).resolve(strict=False)
         target = target_root.resolve(strict=False)
+        if target.is_file():
+            return path == target
         return path == target or path.is_relative_to(target)
     except (OSError, ValueError):
         return False
@@ -155,8 +159,8 @@ def filter_flagged_for_target(
 def prepare_analysis_flagged_csv(
     target: Path | None,
     *,
-    source_csv: Path = FLAGGED_CSV_PATH,
-    scoped_csv: Path = FLAGGED_SCOPED_CSV_PATH,
+    source_csv: Path,
+    scoped_csv: Path,
 ) -> tuple[Path, int, int]:
     """Return the flagged CSV analysis modules should read.
 

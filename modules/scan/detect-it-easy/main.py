@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from kirby_flagged import FLAGGED_CSV_PATH, record_flagged
+from kirby_flagged import record_flagged
 from kirby_log import KirbyLogger
 from kirby_report import format_scan_report_header
 
@@ -240,6 +240,7 @@ def suspicious_detections(
     detections: list[dict[str, str]],
     flagged_types: set[str],
     *,
+    ignore_names: set[str],
     ignore_heuristic_names: set[str],
     allow_heuristic_names: set[str],
     require_non_heuristic: bool,
@@ -249,7 +250,10 @@ def suspicious_detections(
     for row in detections:
         if normalize_detection_type(row.get("type", "")) not in flagged_types:
             continue
-        if is_heuristic_detection(row) and row.get("name", "") in ignore_heuristic_names:
+        name = row.get("name", "")
+        if name in ignore_names:
+            continue
+        if is_heuristic_detection(row) and name in ignore_heuristic_names:
             continue
         hits.append(row)
 
@@ -344,14 +348,18 @@ def run(
     config: Path,
     *,
     verbose: bool = True,
+    flagged_csv: Path | None = None,
+    file_list: Path | None = None,
 ) -> None:
     log = KirbyLogger(verbose, prefix="detect-it-easy")
     log.step(f"Loading config from {config}")
     settings = load_config(config)
 
-    file_list_path = project_path(settings, "file_list")
+    file_list_path = file_list or project_path(settings, "file_list")
+    flagged_csv_path = flagged_csv or file_list_path.parent / "flagged.csv"
     extensions = eligible_extensions(settings)
     flagged_types = flag_types(settings)
+    ignore_names = config_csv_set(settings, "ignore_names")
     ignore_heuristic_names = config_csv_set(settings, "ignore_heuristic_names")
     allow_heuristic_names = config_csv_set(settings, "allow_heuristic_names")
     require_non_heuristic = config_bool(settings, "require_non_heuristic", default=True)
@@ -374,6 +382,8 @@ def run(
     log.step(f"Flagging on detection types: {', '.join(sorted(flagged_types))}")
     if require_non_heuristic:
         log.step("Requiring at least one non-heuristic detection (or allow_heuristic_names match)")
+    if ignore_names:
+        log.step("Ignoring detection names: " + ", ".join(sorted(ignore_names)))
     if ignore_heuristic_names:
         log.step(
             "Ignoring heuristic names: "
@@ -402,6 +412,7 @@ def run(
         hits = suspicious_detections(
             detections,
             flagged_types,
+            ignore_names=ignore_names,
             ignore_heuristic_names=ignore_heuristic_names,
             allow_heuristic_names=allow_heuristic_names,
             require_non_heuristic=require_non_heuristic,
@@ -425,8 +436,8 @@ def run(
         flagged_paths.append(filepath)
 
     if flagged_paths:
-        updated = record_flagged(flagged_paths, TOOL_NAME)
-        log.step(f"Updated {updated} path(s) in {FLAGGED_CSV_PATH}")
+        updated = record_flagged(flagged_paths, TOOL_NAME, csv_path=flagged_csv_path)
+        log.step(f"Updated {updated} path(s) in {flagged_csv_path}")
         log.step(f"Found {len(flagged_paths)} suspicious file(s)")
     else:
         log.step("No suspicious files detected")

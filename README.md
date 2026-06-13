@@ -1,13 +1,14 @@
 # Kirby — Malware Response Scanner
 
-Kirby is a modular malware analysis orchestrator for examining a mounted Windows disk image (typically a BitLocker-encrypted drive decrypted and mounted read-only on macOS). It runs **scan modules** against the target volume to find suspicious files, then optionally runs **analysis modules** to enrich those findings. Each module writes a Markdown report, and scan modules maintain a shared registry of flagged paths.
+Kirby is a modular malware analysis orchestrator for examining a mounted Windows disk image (typically a BitLocker-encrypted drive decrypted and mounted read-only on macOS). It runs **scan modules** against the target volume to find suspicious files, optionally runs **analysis modules** to enrich those findings, and can run **rescue modules** to copy safe user documents off the volume. Each module writes a Markdown report, and scan modules maintain a shared registry of flagged paths.
 
 The intended workflow is:
 
 1. Mount the target volume read-only (`mount_bitlocker.sh`).
-2. Run scan modules with `-e` to populate `tmp/flagged.csv`.
+2. Run scan modules with `-e` to populate `tmp/<name>/flagged.csv`.
 3. Run analysis modules with `-a` to enrich flagged files (e.g. VirusTotal lookups).
-4. Review Markdown reports in `output/` and the consolidated flag list in `tmp/flagged.csv`.
+4. Optionally run rescue modules with `-r` to copy user-owned documents after macro checks.
+5. Review Markdown reports in `output/<name>/` and the consolidated flag list in `tmp/<name>/flagged.csv`.
 
 ---
 
@@ -34,41 +35,72 @@ External tools required depend on which modules you enable — see [Prerequisite
 ## Kirby CLI
 
 ```
-usage: kirby.py [-h] [-t TARGET | -kext] [-e ENGINES] [-a ANALYSIS] [-o OUTPUT] [-s]
+usage: kirby.py [-h] [-t TARGET | -kext] [-e ENGINES] [-a ANALYSIS] [-r RESCUE] [-n NAME] [-o OUTPUT] [-s]
 ```
 
 | Flag | Long form | Required | Default | Description |
 |------|-----------|----------|---------|-------------|
-| `-t` | `--target` | Yes* | — | Scan target directory (e.g. `/Volumes/bitlocker`) |
+| `-t` | `--target` | Yes* | — | Scan target: directory, specific file path, disk image, or block device (e.g. `/Volumes/bitlocker`, `/Volumes/Windows/Users/jane/file.exe`) |
 | `-kext` | — | No | off | Special target: enumerate installed kernel extensions on this Mac and pass them to scan engines |
 | `-e` | `--engines` | No* | — | Comma-separated **scan** module names (e.g. `Yara,ClamAV,oletools`) |
 | `-a` | `--analysis` | No* | — | Comma-separated **analysis** module names (e.g. `virustotal`) |
-| `-o` | `--output` | No | `output/` | Directory for Markdown reports |
+| `-r` | `--rescue` | No* | — | Comma-separated **rescue** module names (e.g. `simple-rescue`) |
+| `-n` | `--name` | No | derived from target | Target name for this run; working files go in `tmp/<name>/`, reports in `output/<name>/` |
+| `-o` | `--output` | No | `output/` | Base output directory; reports go in `<output>/<name>/` |
 | `-s` | `--silent` | No | off | Suppress detailed progress logs and tqdm progress bars |
 
-\*At least one of `-e` or `-a` must be provided. When running scan modules, provide either `-t` or `-kext` (not both).
+\*At least one of `-e`, `-a`, or `-r` must be provided. When running scan or rescue modules, provide either `-t` or `-kext` (not both).
 
-Module names are case-insensitive. Scan modules run first, then analysis modules.
+Module names are case-insensitive. Scan modules run first, then rescue modules, then analysis modules.
 
 Verbose output (step-by-step logs and progress bars) is the **default**. Pass `-s` for minimal output.
+
+### Target naming (`-n`)
+
+Each run uses a target **name** that namespaces both working files and reports. Use `-n` to set it explicitly; otherwise Kirby derives it from the target path by lowercasing and replacing slashes with dashes (e.g. `/Volumes/Windows` → `volumes-windows`, `/dev/disk7s3` → `dev-disk7s3`). With `-kext`, the default name is `kext`. With no target (analysis-only), the default is `analysis` — pass `-n` to match the name used during earlier scan runs.
+
+The same name can be reused across multiple mount points or devices. Each scan appends to `tmp/<name>/flagged.csv`, so one named target can accumulate flagged paths from many locations. During analysis, `-t` still filters that list to paths under the provided target (or to the exact file when `-t` is a file path).
+
+### Single-file targets
+
+Pass a **file path** to `-t` to run scan modules against that one file only. Kirby writes the path to `tmp/<name>/all_files` and passes it to inventory-driven engines (`detect-it-easy`, `oletools`, `mraptor`, etc.). YARA scans the file directly (without recursion). Registry-oriented modules such as RegRipper still expect a directory or volume mount and are not useful with a single-file target.
+
+```bash
+# Scan one executable with Detect It Easy
+python kirby.py -t /Volumes/Windows/Users/riley/Downloads/ChromeSetup.exe -n laptop_ssd -e die
+
+# Combine with other inventory-based engines
+python kirby.py -t /Volumes/Windows/Users/riley/Downloads/report.docm -n laptop_ssd -e die,mraptor,oletools
+```
+
+Use `-n` to keep reports and `flagged.csv` under a familiar target namespace (e.g. `laptop_ssd`) rather than the long derived name from the file path.
 
 ### Examples
 
 ```bash
-# Scan only
+# Scan only (reports in output/volumes-bitlocker/)
 python kirby.py -t /Volumes/bitlocker -e Yara,oletools
 
-# Analyze previously flagged files
-python kirby.py -t /Volumes/bitlocker -a virustotal
+# Named target — working files in tmp/laptop_ssd/, reports in output/laptop_ssd/
+python kirby.py -t /Volumes/Windows -n laptop_ssd -e detect-it-easy,mraptor,regripper,yara
+
+# Scan a second volume into the same named target (merges into tmp/laptop_ssd/flagged.csv)
+python kirby.py -t /Volumes/OtherDrive -n laptop_ssd -e yara
+
+# Analyze only paths under /Volumes/Windows from that shared flag list
+python kirby.py -t /Volumes/Windows -n laptop_ssd -a virustotal
 
 # Full pipeline in one invocation
 python kirby.py -t /Volumes/bitlocker -e Yara,oletools -a virustotal
 
-# Scan installed kernel extensions on this Mac
+# Rescue user documents from a Windows volume (macro-checked Office files)
+python kirby.py -t /Volumes/Windows -n laptop_ssd -r simple-rescue
+
+# Scan installed kernel extensions on this Mac (reports in output/kext/)
 python kirby.py -kext -e detect-it-easy,Yara
 ```
 
-Each module produces `{module}.md` in the output directory (e.g. `output/yara.md`, `output/virustotal.md`).
+Each module produces `{module}.md` under the target output directory (e.g. `output/laptop_ssd/yara.md`, `output/laptop_ssd/virustotal.md`).
 
 ### `-kext` special target
 
@@ -78,7 +110,7 @@ Use `-kext` instead of `-t` to scan kernel extensions installed on the local mac
 - `/System/Library/Extensions`
 - `/Library/Apple/System/Library/Extensions`
 
-It writes every file inside those bundles to `tmp/all_files` (with SHA-256 hashes in `tmp/sha256_hashes`) and passes that inventory to scan engines that read the file list (`detect-it-easy`, `oletools`, `mraptor`, etc.). YARA scans those kext directories recursively. The inventory is cached under `cache/kext/` and reused until bundle paths or modification times change.
+It writes every file inside those bundles to `tmp/<name>/all_files` (with SHA-256 hashes in `tmp/<name>/sha256_hashes`) and passes that inventory to scan engines that read the file list (`detect-it-easy`, `oletools`, `mraptor`, etc.). YARA scans those kext directories recursively. The inventory is cached under `cache/kext/` and reused until bundle paths or modification times change.
 
 `-kext` cannot be combined with `-t`.
 
@@ -86,18 +118,23 @@ It writes every file inside those bundles to `tmp/all_files` (with SHA-256 hashe
 
 ## Shared behavior
 
-When scan modules run, Kirby first builds or reuses a file inventory:
+When scan or rescue modules run, Kirby first builds or reuses a file inventory, then publishes it under `tmp/<name>/`:
 
-- **`tmp/all_files`** — one absolute path per line for every file on the target volume
-- **`tmp/all_files.meta`** — volume fingerprint (UUID, device, size) used to skip re-indexing when the volume has not changed
+- **`tmp/<name>/all_files`** — one absolute path per line for files under the current `-t` target
+- **`tmp/<name>/all_files.meta`** — fingerprint used to skip re-indexing when the target has not changed
+- **`tmp/<name>/sha256_hashes`** — tab-separated path and SHA-256 digest for indexed files
+
+**Directory targets** use a **volume-level** cache under `cache/volumes/<mount>/_root/`. Kirby walks the mount point once, then filters paths when `-t` is a subdirectory. Scanning `/Volumes/Windows/Users` after `/Volumes/Windows` reuses the same cache.
+
+**Single-file targets** skip volume indexing: Kirby hashes the file and writes one line to `tmp/<name>/all_files`. The fingerprint in `all_files.meta` tracks path, size, and modification time.
 
 Scan modules that flag suspicious files append to a shared CSV:
 
-- **`tmp/flagged.csv`** — two columns: full file path, comma-separated list of scan modules that flagged it (e.g. `Yara,oletools`)
+- **`tmp/<name>/flagged.csv`** — path, comma-separated scan modules that flagged it, and optional SHA-256 hash
 
-If multiple scan modules flag the same path, Kirby merges module names into the second column rather than duplicating rows.
+If multiple scan modules flag the same path, Kirby merges module names into the second column rather than duplicating rows. Scanning different volumes with the same `-n` merges into the same `flagged.csv`.
 
-Analysis modules read from `tmp/flagged.csv` rather than scanning the volume directly.
+Analysis modules read from `tmp/<name>/flagged.csv`. When `-t` is provided, only paths under that target are analyzed (written to `tmp/<name>/flagged-scoped.csv` for the run).
 
 ---
 
@@ -117,9 +154,9 @@ Signature-based scanning using [Neo23x0's signature-base](https://github.com/Neo
 
 **Output**
 
-- `output/yara.md` — scan metadata and a table of all rule matches
+- `output/<name>/yara.md` — scan metadata and a table of all rule matches
 
-**Flagged files (`tmp/flagged.csv`)**
+**Flagged files (`tmp/<name>/flagged.csv`)**
 
 - Every file that matches at least one YARA rule (tool name: `Yara`)
 
@@ -150,15 +187,15 @@ Macro and OLE analysis using [oletools](https://github.com/decalage2/oletools) `
 
 **What it does**
 
-- Reads paths from `tmp/all_files` (built by Kirby)
+- Reads paths from `tmp/<name>/all_files` (built by Kirby)
 - Filters to configured Office/OLE extensions
 - Runs `olevba` on each eligible file
 
 **Output**
 
-- `output/oletools.md` — **full output for every eligible file** scanned (including clean files and parse errors)
+- `output/<name>/oletools.md` — **full output for every eligible file** scanned (including clean files and parse errors)
 
-**Flagged files (`tmp/flagged.csv`)**
+**Flagged files (`tmp/<name>/flagged.csv`)**
 
 - Files where olevba output contains indicator rows for **Suspicious**, **AutoExec**, **IOC**, **Hex**, or **Base64** (tool name: `oletools`)
 
@@ -166,7 +203,7 @@ Macro and OLE analysis using [oletools](https://github.com/decalage2/oletools) `
 
 | Layer | Filtering |
 |-------|-----------|
-| Input files | Extension list in config, intersected with `tmp/all_files` |
+| Input files | Extension list in config, intersected with `tmp/<name>/all_files` |
 | Report | **None** — all eligible files appear in the report |
 | Flagged output | **Moderate** — only files with suspicious indicator types in olevba's analysis table; clean macros and unsupported-file errors are not flagged |
 
@@ -174,10 +211,43 @@ Macro and OLE analysis using [oletools](https://github.com/decalage2/oletools) `
 
 | Option | Description |
 |--------|-------------|
-| `file_list` | Path to Kirby's file inventory (default: `tmp/all_files`) |
+| `file_list` | Path to Kirby's file inventory (default: `tmp/<name>/all_files`) |
 | `extensions` | Comma-separated Office/OLE extensions (`.doc`, `.docx`, `.xls`, `.ppt`, `.rtf`, `.msi`, etc.) |
 
 **Prerequisites:** `oletools` installed in the project venv (`pip install -r requirements.txt`)
+
+---
+
+### mraptor
+
+Malicious macro detection using [oletools](https://github.com/decalage2/oletools) **MacroRaptor** against VBA-capable Office files from the file inventory.
+
+**What it does**
+
+- Reads paths from `tmp/<name>/all_files` (built by Kirby)
+- Filters to configured VBA-capable Office extensions (`.docm`, `.xlsm`, `.pptm`, etc.)
+- Validates file headers when enabled (skips mislabeled or Recycle Bin sidecar files)
+- Runs `mraptor` on each eligible file; exit code `20` indicates suspicious macro behavior
+
+**Output**
+
+- `output/<name>/mraptor.md` — suspicious macro detections per flagged file
+
+**Flagged files (`tmp/<name>/flagged.csv`)**
+
+- Files where mraptor reports suspicious macro behavior (tool name: `mraptor`)
+
+**Configuration** (`modules/scan/mraptor/mraptor.conf`)
+
+| Option | Description |
+|--------|-------------|
+| `file_list` | Path to Kirby's file inventory (default: `tmp/<name>/all_files`) |
+| `extensions` | Comma-separated VBA-capable Office extensions |
+| `exclude_recycle_bin_sidecars` | Skip `$Recycle.Bin` `$I*` metadata files (default: `true`) |
+| `validate_file_headers` | Require OLE/OpenXML/SLK header signatures (default: `true`) |
+| `show_matches` | Pass `-m` to include matched heuristic strings in output (default: `true`) |
+
+**Prerequisites:** `oletools` / `mraptor` in the project venv (`pip install -r requirements.txt`)
 
 ---
 
@@ -195,9 +265,9 @@ Windows registry persistence analysis using [RegRipper 3.0](https://github.com/k
 
 **Output**
 
-- `output/regripper.md` — summary of suspect registry entries by category
+- `output/<name>/regripper.md` — summary of suspect registry entries by category
 
-**Flagged files (`tmp/flagged.csv`)**
+**Flagged files (`tmp/<name>/flagged.csv`)**
 
 - Executable paths referenced by suspect registry entries that resolve to existing files on the target volume (tool name: `regripper`)
 
@@ -221,18 +291,20 @@ Windows registry persistence analysis using [RegRipper 3.0](https://github.com/k
 
 Packer and protector identification using [Detect It Easy](https://github.com/horsicq/Detect-It-Easy) (`diec`) against executable-like files from the file inventory.
 
+Module name alias: `die` (e.g. `-e die` is equivalent to `-e detect-it-easy`).
+
 **What it does**
 
-- Reads paths from `tmp/all_files` (built by Kirby)
+- Reads paths from `tmp/<name>/all_files` (built by Kirby)
 - Filters to configured executable/script extensions (`.exe`, `.dll`, `.sys`, `.ps1`, `.dylib`, etc.) and, when `scan_macos_binaries` is enabled, extension-less Mach-O binaries under `Contents/MacOS/`
 - Runs `diec` with the local signature database under `modules/scan/detect-it-easy/Detect-it-easy/`
 - Flags files with packer, protector, cryptor, or related detection types
 
 **Output**
 
-- `output/detect-it-easy.md` — suspicious detections per flagged file
+- `output/<name>/detect-it-easy.md` — suspicious detections per flagged file
 
-**Flagged files (`tmp/flagged.csv`)**
+**Flagged files (`tmp/<name>/flagged.csv`)**
 
 - Files where `diec` reports a detection type listed in `flag_types` (tool name: `detect-it-easy`)
 
@@ -244,7 +316,7 @@ Packer and protector identification using [Detect It Easy](https://github.com/ho
 | `database` | Primary signature database (`Detect-it-easy/db`) |
 | `extra_database` | Extra signatures (`Detect-it-easy/db_extra`) |
 | `custom_database` | Custom signatures (`Detect-it-easy/db_custom`) |
-| `file_list` | Path to Kirby's file inventory (default: `tmp/all_files`) |
+| `file_list` | Path to Kirby's file inventory (default: `tmp/<name>/all_files`) |
 | `extensions` | Comma-separated extensions to scan |
 | `scan_macos_binaries` | Include extension-less Mach-O binaries under `Contents/MacOS/` (default: `true`) |
 | `flag_types` | Detection types that cause a file to be flagged |
@@ -276,7 +348,7 @@ Then set `diec` in `detect-it-easy.conf` to `modules/scan/detect-it-easy/DIE-eng
 
 Signature data is cloned separately under `modules/scan/detect-it-easy/Detect-it-easy/` (the [Detect-It-Easy](https://github.com/horsicq/Detect-It-Easy) database repo). Kirby passes these paths to `diec` via `-D`, `-E`, and `-C`, so the bundled signatures inside `DiE.app` are not used.
 
-**False positive tuning:** Vendor binaries often trigger heuristic `~protection` hits (`Obfuscation`, `Anti analysis`, `Generic`) or `~malware` / `Anomalous build info`. The defaults above focus on named signature detections (e.g. `UPX`, `Crypto Obfuscator`) and skip heuristic-only hits on Authenticode-signed files. For stricter triage, keep `require_non_heuristic = true` and omit `protection` from `flag_types`. For broader coverage, add `protection` back or set `require_non_heuristic = false`. Cross-reference remaining flags with VirusTotal and YARA results in `tmp/flagged.csv`.
+**False positive tuning:** Vendor binaries often trigger heuristic `~protection` hits (`Obfuscation`, `Anti analysis`, `Generic`) or `~malware` / `Anomalous build info`. The defaults above focus on named signature detections (e.g. `UPX`, `Crypto Obfuscator`) and skip heuristic-only hits on Authenticode-signed files. For stricter triage, keep `require_non_heuristic = true` and omit `protection` from `flag_types`. For broader coverage, add `protection` back or set `require_non_heuristic = false`. Cross-reference remaining flags with VirusTotal and YARA results in `tmp/<name>/flagged.csv`.
 
 ---
 
@@ -286,7 +358,7 @@ Antivirus scanning via ClamAV. **Not yet implemented** — the module is a place
 
 **Output**
 
-- `output/clamav.md` — currently empty
+- `output/<name>/clamav.md` — currently empty
 
 **Flagged files**
 
@@ -305,7 +377,7 @@ Antivirus scanning via ClamAV. **Not yet implemented** — the module is a place
 
 ## Analysis modules
 
-Analysis modules live under `modules/analysis/` and are invoked with `-a`. They operate on files already flagged by scan modules in `tmp/flagged.csv`.
+Analysis modules live under `modules/analysis/` and are invoked with `-a`. They operate on files already flagged by scan modules in `tmp/<name>/flagged.csv`.
 
 ### VirusTotal
 
@@ -313,26 +385,26 @@ Looks up SHA256 hashes for files flagged by scan modules and retrieves enrichmen
 
 **What it does**
 
-- Reads file paths from `tmp/flagged.csv`
+- Reads file paths from `tmp/<name>/flagged.csv`
 - Computes SHA256 for each flagged file that still exists on disk
-- Writes hashes to `tmp/virustotal-hashes` (`sha256<TAB>path`)
+- Writes hashes to `tmp/<name>/virustotal-hashes` (`sha256<TAB>path`)
 - Looks up each hash in VirusTotal (`GET /api/v3/files/{sha256}`)
 - Caches API responses in `cache/virustotal-cache.db` (SQLite) to avoid repeat lookups
 - Logs a one-line summary to the terminal after each lookup
 
 **Output**
 
-- `output/virustotal.md` — VirusTotal enrichment for each flagged file analyzed, including which scan modules flagged it
+- `output/<name>/virustotal.md` — VirusTotal enrichment for each flagged file analyzed, including which scan modules flagged it
 
 **Flagged files**
 
-- Does not write to `tmp/flagged.csv` (analysis modules consume the flag list rather than contributing to it)
+- Does not write to `tmp/<name>/flagged.csv` (analysis modules consume the flag list rather than contributing to it)
 
 **Result filtering**
 
 | Layer | Filtering |
 |-------|-----------|
-| Input files | Only paths listed in `tmp/flagged.csv` that still exist on disk |
+| Input files | Only paths listed in `tmp/<name>/flagged.csv` that still exist on disk |
 | VirusTotal lookup | All flagged files are looked up (cache-first) |
 | Report | **None** — all analyzed files appear in the report with their VirusTotal response or error |
 
@@ -340,12 +412,44 @@ Looks up SHA256 hashes for files flagged by scan modules and retrieves enrichmen
 
 | Option | Description |
 |--------|-------------|
-| `flagged_csv` | Path to the shared flag list (default: `tmp/flagged.csv`) |
-| `hashes_output` | Path for the hash list (default: `tmp/virustotal-hashes`) |
+| `flagged_csv` | Path to the shared flag list (default: `tmp/<name>/flagged.csv`) |
+| `hashes_output` | Path for the hash list (default: `tmp/<name>/virustotal-hashes`) |
 | `cache_db` | SQLite cache path (default: `cache/virustotal-cache.db`) |
 | `api_delay_seconds` | Minimum seconds between VirusTotal API requests (default: `15`, suited to free-tier rate limits) |
 
 **Environment:** set `VIRUSTOTAL_API_KEY` in `.env` at the project root (or in the environment).
+
+---
+
+### signatures
+
+Code signature verification for flagged executables using `codesign`, `osslsigncode`, `exiftool`, and `strings`.
+
+**What it does**
+
+- Reads flagged paths from `tmp/<name>/flagged.csv` (or the scoped list when `-t` is provided)
+- Filters to configured executable-like extensions (`.exe`, `.dll`, `.sys`, etc.)
+- On macOS, runs `codesign -dv --verbose=4` and `codesign --verify --strict --verbose=2`
+- On Windows PE files, runs `osslsigncode verify` when available
+- Collects Authenticode and PE metadata via `exiftool`; dumps leading strings on verification failure
+
+**Output**
+
+- `output/<name>/signatures.md` — per-file signature verification results
+
+**Flagged files**
+
+- Does not write to `tmp/<name>/flagged.csv`
+
+**Configuration** (`modules/analysis/signatures/signatures.conf`)
+
+| Option | Description |
+|--------|-------------|
+| `flagged_csv` | Path to the shared flag list (default: `tmp/<name>/flagged.csv`) |
+| `extensions` | Executable-like extensions to analyze from flagged paths |
+| `strings_limit` | Lines of `strings` output when verification fails (default: `10`) |
+
+**Prerequisites:** `codesign` (macOS), optional `osslsigncode` (`brew install osslsigncode`), `exiftool`, and `strings` on `PATH`.
 
 ---
 
@@ -361,11 +465,11 @@ Builds a filesystem MAC-time timeline from the BitLocker-encrypted device using 
 
 **Output**
 
-- `output/sleuthkit-mactime.md` — timeline metadata and mactime output for the selected window
+- `output/<name>/sleuthkit-mactime.md` — timeline metadata and mactime output for the selected window
 
 **Flagged files**
 
-- Does not read or write `tmp/flagged.csv`
+- Does not read or write `tmp/<name>/flagged.csv`
 
 **Configuration**
 
@@ -410,16 +514,85 @@ Requires `sudo` when reading raw block devices. Verify the partition with `disku
 
 ---
 
+## Rescue modules
+
+Rescue modules live under `modules/rescue/` and are invoked with `-r`. They operate on the same file inventory as scan modules (`tmp/<name>/all_files`) and require a mounted target (`-t` or `-kext`).
+
+### simple-rescue
+
+Copy user-owned documents, spreadsheets, images, and email files from a Windows volume after screening VBA-capable Office files with **mraptor**.
+
+**What it does**
+
+1. Detect whether the target is a **Windows** or **macOS** volume (`Windows/` vs `System/Library` layout). macOS rescue is stubbed and reports without copying files.
+2. On Windows volumes, discover non-default user profiles under `Users/` (profiles with `NTUSER.DAT`, skipping Default/Public/All Users).
+3. Filter the indexed file list to files under each profile that match configured document, spreadsheet, image, or email extensions.
+4. Write the candidate list to `tmp/<name>/simple-rescue-candidates.txt`.
+5. Run **mraptor** against VBA-capable Office files in the candidate set; block copy of suspicious files.
+6. Copy safe files to `output/<name>/simple-rescue/<User>/<relative-path>` preserving profile-relative paths.
+
+**Output**
+
+- `output/<name>/simple-rescue.md` — summary report
+- `output/<name>/simple-rescue/report.md` — full report with inclusion criteria, user profiles, excluded files (with mraptor output), and copied files
+- `output/<name>/simple-rescue/<User>/...` — rescued files
+- `tmp/<name>/simple-rescue-candidates.txt` — temporary candidate file list
+
+**Flagged files (`tmp/<name>/flagged.csv`)**
+
+- VBA-capable files flagged by mraptor during rescue are appended with tool name `mraptor`
+
+**Inclusion criteria**
+
+| Layer | Filtering |
+|-------|-----------|
+| Volume type | Windows volumes only (macOS stub) |
+| User profiles | Non-default profiles under `Users/` with `NTUSER.DAT` |
+| Ownership | Files under the profile directory, excluding configured skip paths |
+| Content scope | Configured user content directories (Desktop, Documents, etc.) |
+| File types | Document, spreadsheet, image, or email extensions from config |
+| Macro safety | VBA-capable Office files must pass mraptor (exit code ≠ 20) |
+
+**Configuration** (`modules/rescue/simple-rescue/simple-rescue.conf`)
+
+| Option | Description |
+|--------|-------------|
+| `file_list` | Indexed file list (default `tmp/<name>/all_files`; Kirby passes the per-target path) |
+| `users_dir` | Relative path to Windows `Users` directory |
+| `skip_user_profiles` | Default/system profiles to skip |
+| `user_content_dirs` | Profile subdirectories to include (empty = entire profile except skips) |
+| `skip_profile_paths` | Profile-relative paths to exclude |
+| `document_extensions` | Document file extensions |
+| `spreadsheet_extensions` | Spreadsheet file extensions |
+| `image_extensions` | Image file extensions |
+| `email_extensions` | Email file extensions |
+| `mraptor_config` | Path to mraptor scan module config |
+| `mraptor_show_matches` | Pass `-m` to mraptor for matched heuristic strings |
+
+**Prerequisites:** Same as the mraptor scan module (`oletools` via pip or `.venv/bin/mraptor`).
+
+**Usage**
+
+```bash
+python kirby.py -t /Volumes/Windows -n laptop_ssd -r simple-rescue
+```
+
+---
+
 ## Output artifacts
 
 | Path | Description |
 |------|-------------|
-| `output/{module}.md` | Per-module Markdown report |
-| `tmp/all_files` | Full file inventory for the target volume |
-| `tmp/flagged.csv` | Consolidated list of flagged paths and which scan modules flagged them |
-| `tmp/virustotal-hashes` | SHA256 hashes of flagged files analyzed by VirusTotal |
+| `output/<name>/{module}.md` | Per-module Markdown report for the named target run |
+| `output/<name>/simple-rescue/report.md` | Full simple-rescue report (copied files, criteria, excluded files) |
+| `output/<name>/simple-rescue/<User>/...` | Rescued user files copied by simple-rescue |
+| `tmp/<name>/simple-rescue-candidates.txt` | Candidate file list built by simple-rescue |
+| `tmp/<name>/all_files` | Full file inventory for the current scan target |
+| `tmp/<name>/flagged.csv` | Consolidated list of flagged paths and which scan modules flagged them |
+| `tmp/<name>/flagged-scoped.csv` | Target-filtered subset of `flagged.csv` used during analysis |
+| `tmp/<name>/virustotal-hashes` | SHA256 hashes of flagged files analyzed by VirusTotal |
 | `cache/virustotal-cache.db` | VirusTotal API response cache |
-| `output/sleuthkit-mactime.md` | MAC-time timeline from Sleuth Kit |
+| `output/<name>/sleuthkit-mactime.md` | MAC-time timeline from Sleuth Kit |
 
 ---
 
@@ -449,11 +622,14 @@ pip install -r requirements.txt
 |--------|------|---------------------|
 | Yara | Scan | `yara`, `yarac` |
 | oletools | Scan | Included via pip |
+| mraptor | Scan | Included via pip (oletools) |
 | RegRipper | Scan | `perl`, `cpan` (first-run setup) |
 | detect-it-easy | Scan | `diec` (official pkg or local build via `build.sh`) |
 | ClamAV | Scan | Not yet used |
 | VirusTotal | Analysis | VirusTotal API key in `.env` |
+| signatures | Analysis | `codesign`, optional `osslsigncode`, `exiftool`, `strings` |
 | sleuthkit-mactime | Analysis | Local Sleuth Kit build; `sudo` for raw device access |
+| simple-rescue | Rescue | mraptor / oletools (via pip) |
 
 ---
 
@@ -461,19 +637,26 @@ pip install -r requirements.txt
 
 ```
 kirby.py              # CLI orchestrator
+kirby_paths.py        # Per-target tmp/ and output/ path helpers
 kirby_log.py          # Logging and progress helpers
 kirby_flagged.py      # Shared flagged-file registry
+kirby_index.py        # Volume and single-file inventory caching
+kirby_target.py       # Target path resolution helpers
 modules/
   scan/
     yara/             # YARA signature scanning
-    oletools/         # Office macro analysis
+    oletools/         # Office macro analysis (olevba)
+    mraptor/           # Malicious macro detection (MacroRaptor)
     regripper/        # Windows registry persistence analysis
     detect-it-easy/   # Detect It Easy packer/protector scanning
     clamav/           # ClamAV (placeholder)
   analysis/
     virustotal/       # VirusTotal hash enrichment
+    signatures/       # PE / Authenticode signature verification
     sleuthkit-mactime/  # Sleuth Kit MAC timeline, local build, and sleuthkit.conf
-output/               # Markdown reports
-tmp/                  # File inventory, flagged.csv, hash lists
-cache/                # VirusTotal cache database
+  rescue/
+    simple-rescue/    # Copy user documents after mraptor macro checks
+output/               # Markdown reports (one subdirectory per target run)
+tmp/                  # Per-target working files (tmp/<name>/)
+cache/                # Volume inventory and VirusTotal API cache
 ```

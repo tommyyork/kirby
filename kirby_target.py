@@ -58,10 +58,24 @@ def is_mount_table_source(path: Path) -> bool:
     return False
 
 
+def is_regular_file_target(path: Path) -> bool:
+    """True when -t points at a single regular file to scan."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def is_scan_target(path: Path) -> bool:
+    """True for directory, single-file, or -kext-style scan targets."""
+    return path.is_dir() or is_regular_file_target(path)
+
+
 def is_analysis_target(path: Path) -> bool:
-    """True for mount points, disk images, block devices, and active mount sources."""
+    """True for mount points, disk images, block devices, files, and active mount sources."""
     return (
         path.is_dir()
+        or is_regular_file_target(path)
         or is_disk_image_or_device(path)
         or is_mount_table_source(path)
     )
@@ -97,8 +111,10 @@ def mount_point_for_source(source: Path) -> Path | None:
 
 
 def resolve_flagged_filter_root(target: Path) -> Path:
-    """Resolve -t target to a directory root for flagged-path filtering."""
+    """Resolve -t target to a directory or file root for flagged-path filtering."""
     resolved = target.resolve(strict=False)
+    if resolved.is_file():
+        return resolved
     if resolved.is_dir():
         return resolved
 
