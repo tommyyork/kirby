@@ -21,7 +21,7 @@ from kirby_report import format_scan_report_header, scan_timestamp
 
 MODULE_DIR = Path(__file__).resolve().parent
 RUN_DIR = MODULE_DIR / "run"
-TOOL_NAME = "ClamAV"
+TOOL_NAME = "clamav"
 
 FOUND_PATTERN = re.compile(
     r"^(?P<path>.+?):\s+(?P<signature>.+?)\s+FOUND\s*$",
@@ -154,10 +154,14 @@ def ensure_clamd(clamdscan: str, clamd: str, clamd_conf: Path, log: KirbyLogger)
     log.step("clamd is ready")
 
 
-def scan_targets(target: Path) -> list[Path]:
+def scan_targets(target: Path, *, include_kext: bool = False) -> list[Path]:
     if is_kext_target(target):
         return [path.resolve(strict=False) for path in kext_search_roots()]
-    return [target.resolve(strict=False)]
+
+    roots = [target.resolve(strict=False)]
+    if include_kext:
+        roots.extend(path.resolve(strict=False) for path in kext_search_roots())
+    return roots
 
 
 def parse_detections(text: str) -> list[ClamDetection]:
@@ -304,6 +308,7 @@ def run(
     verbose: bool = True,
     flagged_csv: Path | None = None,
     file_list: Path | None = None,
+    include_kext: bool = False,
 ) -> None:
     log = KirbyLogger(verbose, prefix="clamav")
     log.step(f"Loading config from {config}")
@@ -329,7 +334,7 @@ def run(
 
     ensure_clamd(clamdscan_bin, clamd_bin, clamd_conf, log)
 
-    scan_roots = scan_targets(target)
+    scan_roots = scan_targets(target, include_kext=include_kext)
     all_detections: list[ClamDetection] = []
     seen_paths: set[str] = set()
 

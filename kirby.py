@@ -9,11 +9,11 @@ import sys
 from pathlib import Path
 from typing import Literal
 
-from kirby_flagged import backfill_flagged_hashes, prepare_analysis_flagged_csv
-from kirby_index import ensure_file_list, ensure_single_file_list
-from kirby_kext import KEXT_TARGET, ensure_kext_file_list, is_kext_target
+from kirby_flagged import backfill_flagged_hashes, normalize_flagged_csv, prepare_analysis_flagged_csv
+from kirby_index import ensure_file_list, ensure_single_file_list, count_indexed_paths
+from kirby_kext import KEXT_TARGET, append_kext_to_inventory, ensure_kext_file_list, is_kext_target
 from kirby_log import KirbyLogger
-from kirby_paths import target_paths
+from kirby_paths import DEFAULT_NAMESPACE, target_paths
 from kirby_target import is_analysis_target, is_disk_image_or_device, is_mount_table_source, is_regular_file_target
 
 
@@ -84,7 +84,11 @@ def load_module_main(module_dir: Path):
 
 
 def parse_module_list(raw: str) -> list[str]:
-    modules = [part.strip() for part in raw.split(",") if part.strip()]
+    modules = [
+        normalize_module_name(part)
+        for part in raw.split(",")
+        if part.strip()
+    ]
     if not modules:
         raise argparse.ArgumentTypeError("At least one module must be specified")
     return modules
@@ -101,16 +105,6 @@ def validate_target_name(name: str) -> str:
     return cleaned
 
 
-def derive_target_name(target: Path | None, *, kext: bool) -> str:
-    if kext:
-        return "kext"
-    if target is None:
-        return "analysis"
-    normalized = str(target).lower().replace("\\", "/")
-    name = normalized.replace("/", "-").strip("-")
-    return name or "target"
-
-
 def run_module(
     name: str,
     kind: ModuleKind,
@@ -121,6 +115,7 @@ def run_module(
     flagged_csv: Path | None = None,
     file_list: Path | None = None,
     hashes_output: Path | None = None,
+    include_kext: bool = False,
 ) -> Path:
     log = KirbyLogger(verbose, prefix=normalize_module_name(name))
     module_dir = resolve_module_dir(name, kind)
@@ -144,6 +139,8 @@ def run_module(
         kwargs["file_list"] = file_list
     if hashes_output is not None:
         kwargs["hashes_output"] = hashes_output
+    if include_kext:
+        kwargs["include_kext"] = include_kext
 
     run(**kwargs)
 
@@ -177,21 +174,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Scan target: mount point directory, specific file path, disk image file, or "
             "block device (e.g. /Volumes/bitlocker, /Volumes/Windows/Users/jane/file.exe, "
-            "/dev/disk4). Not required with -kext. Optional for -a virustotal or -a "
-            "signatures when using tmp/<name>/flagged.csv; when provided, analysis modules "
-            "only process flagged paths under the target."
+            "/dev/disk4). Optional with -kext to also scan local kernel extensions. "
+            "Optional for -a virustotal or -a signatures when using tmp/<name>/flagged.csv; "
+            "when provided, analysis modules only process flagged paths under the target."
         ),
     )
     parser.add_argument(
         "-kext",
         action="store_true",
-        help="Special target: enumerate installed kernel extensions on this Mac and pass them to scan engines via tmp/<name>/all_files.",
+        help=(
+            "Include installed kernel extensions on this Mac. With -t, scans the target "
+            "and kexts; without -t, scans kexts only."
+        ),
     )
     parser.add_argument(
         "-e",
         "--engines",
         type=parse_module_list,
-        help="Comma-separated scan module names (e.g. Yara,ClamAV,oletools)",
+        help="Comma-separated scan module names (e.g. yara,clamav,oletools)",
     )
     parser.add_argument(
         "-a",
@@ -210,9 +210,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--name",
         type=validate_target_name,
         help=(
-            "Target name for this run; working files go under tmp/<name>/ and markdown "
-            "reports under output/<name>/ (default: derived from -t or -kext, e.g. "
-            "/Volumes/Windows -> volumes-windows)"
+            "Namespace for this run. Working files go under tmp/<name>/ and markdown "
+            f"reports under output/<name>/ (default: {DEFAULT_NAMESPACE!r} when omitted). "
+            "Use the same name across runs to merge flagged paths and share reports."
         ),
     )
     parser.add_argument(
@@ -270,12 +270,11 @@ def main(argv: list[str] | None = None) -> int:
     scan_modules = args.engines or []
     analysis_modules = args.analysis or []
     rescue_modules = args.rescue or []
-
-    if args.kext and args.target is not None:
-        parser.error("-kext cannot be combined with -t/--target")
+    include_kext = args.kext
+    kext_only = include_kext and args.target is None
 
     target: Path | None
-    if args.kext:
+    if kext_only:
         target = KEXT_TARGET
     elif args.target is not None:
         target = args.target.resolve(strict=False)
@@ -290,9 +289,11 @@ def main(argv: list[str] | None = None) -> int:
         if analysis_modules_require_target(analysis_modules):
             parser.error("-t/--target is required for the selected analysis module(s)")
         print(
-            f"[kirby] No target argument was provided; use -n to select which "
-            f"tmp/<name>/flagged.csv to analyze."
+            f"[kirby] No target argument was provided; analyzing "
+            f"tmp/{DEFAULT_NAMESPACE}/flagged.csv (use -n to select another namespace)."
         )
+    elif kext_only and rescue_modules:
+        parser.error("Rescue modules require -t/--target (-kext alone is not supported)")
     elif not is_kext_target(target):
         try:
             validate_target(
@@ -303,12 +304,12 @@ def main(argv: list[str] | None = None) -> int:
         except argparse.ArgumentTypeError as exc:
             parser.error(str(exc))
 
-    target_name = args.name if args.name is not None else derive_target_name(
-        target,
-        kext=args.kext,
-    )
+    target_name = args.name if args.name is not None else DEFAULT_NAMESPACE
     paths = target_paths(target_name)
     paths.ensure_tmp_dir()
+    normalized_flagged = normalize_flagged_csv(paths.flagged_csv)
+    if normalized_flagged:
+        log.step(f"Normalized tool names for {normalized_flagged} path(s) in {paths.flagged_csv}")
     output_dir = (args.output / target_name).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -317,6 +318,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if is_kext_target(target):
         log.step("Resolved target: macOS kernel extensions (-kext)")
+    elif include_kext and target is not None:
+        log.step(f"Resolved target: {target} plus macOS kernel extensions (-kext)")
     elif target is not None and is_regular_file_target(target):
         log.step(f"Resolved target: single file {target}")
     elif target is not None:
@@ -357,6 +360,13 @@ def main(argv: list[str] | None = None) -> int:
                 paths.sha256_hashes,
                 log,
             )
+        if include_kext and not is_kext_target(target):
+            append_kext_to_inventory(
+                paths.all_files,
+                paths.sha256_hashes,
+                log,
+            )
+        file_count = count_indexed_paths(paths.all_files)
         log.step(f"File inventory ready ({file_count} paths)")
 
     for module in scan_modules:
@@ -370,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
                 verbose,
                 flagged_csv=paths.flagged_csv,
                 file_list=paths.all_files,
+                include_kext=include_kext and not is_kext_target(target),
             )
         except (FileNotFoundError, ImportError, AttributeError, TypeError, RuntimeError) as exc:
             print(f"Error running scan module {module}: {exc}", file=sys.stderr)
@@ -409,6 +420,7 @@ def main(argv: list[str] | None = None) -> int:
             target,
             source_csv=paths.flagged_csv,
             scoped_csv=paths.flagged_scoped_csv,
+            include_kext=include_kext and not is_kext_target(target),
         )
         if target is None:
             log.step(

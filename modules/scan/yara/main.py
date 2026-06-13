@@ -17,7 +17,7 @@ from kirby_kext import is_kext_target, kext_search_roots
 from kirby_log import KirbyLogger
 from kirby_report import format_scan_report_header
 
-TOOL_NAME = "Yara"
+TOOL_NAME = "yara"
 
 MODULE_DIR = Path(__file__).resolve().parent
 COMPILED_RULES_NAME = "kirby-compiled.yarc"
@@ -263,6 +263,7 @@ def run(
     verbose: bool = True,
     flagged_csv: Path | None = None,
     file_list: Path | None = None,
+    include_kext: bool = False,
 ) -> None:
     log = KirbyLogger(verbose, prefix="yara")
     log.step(f"Loading config from {config}")
@@ -273,22 +274,39 @@ def run(
     recursive = settings.getboolean("yara", "recursive", fallback=True)
     log.step(f"Recursive scan: {recursive}")
 
+    matches: list[tuple[str, str]] = []
+    stderr_parts: list[str] = []
+
     if is_kext_target(target):
         log.step("Scanning kernel extension directories")
-        matches, stderr, _returncode = run_yara_kext(compiled, recursive, log)
+        kext_matches, kext_stderr, _returncode = run_yara_kext(compiled, recursive, log)
+        matches.extend(kext_matches)
+        if kext_stderr.strip():
+            stderr_parts.append(kext_stderr.strip())
     elif target.is_file():
         log.step("Scanning single file target")
         result = run_yara(compiled, target, recursive=False, log=log)
         if result.returncode not in (0, 1):
             raise RuntimeError(result.stderr.strip() or f"yara exited with code {result.returncode}")
-        matches = parse_matches(result.stdout)
-        stderr = result.stderr
+        matches.extend(parse_matches(result.stdout))
+        if result.stderr.strip():
+            stderr_parts.append(result.stderr.strip())
     else:
         result = run_yara(compiled, target, recursive, log)
         if result.returncode not in (0, 1):
             raise RuntimeError(result.stderr.strip() or f"yara exited with code {result.returncode}")
-        matches = parse_matches(result.stdout)
-        stderr = result.stderr
+        matches.extend(parse_matches(result.stdout))
+        if result.stderr.strip():
+            stderr_parts.append(result.stderr.strip())
+
+    if include_kext and not is_kext_target(target):
+        log.step("Also scanning kernel extension directories")
+        kext_matches, kext_stderr, _returncode = run_yara_kext(compiled, recursive, log)
+        matches.extend(kext_matches)
+        if kext_stderr.strip():
+            stderr_parts.append(kext_stderr.strip())
+
+    stderr = "\n\n".join(stderr_parts)
 
     log.step(f"Scan complete: {len(matches)} match(es)")
     if stderr.strip():

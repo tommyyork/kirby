@@ -14,6 +14,21 @@ ROOT = Path(__file__).resolve().parent
 FlaggedEntry = tuple[list[str], str]
 
 
+def normalize_tool_name(tool: str) -> str:
+    return tool.strip().lower()
+
+
+def normalize_tool_list(tools: list[str]) -> list[str]:
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for tool in tools:
+        name = normalize_tool_name(tool)
+        if name and name not in seen:
+            seen.add(name)
+            normalized.append(name)
+    return normalized
+
+
 def _normalize_path(path: str | Path) -> str:
     return str(Path(path).resolve())
 
@@ -28,7 +43,9 @@ def load_flagged(csv_path: Path) -> dict[str, FlaggedEntry]:
             if len(row) < 2:
                 continue
             path = row[0].strip()
-            tools = [tool.strip() for tool in row[1].split(",") if tool.strip()]
+            tools = normalize_tool_list(
+                [tool.strip() for tool in row[1].split(",") if tool.strip()]
+            )
             sha256 = row[2].strip() if len(row) >= 3 else ""
             if path:
                 flagged[path] = (tools, sha256)
@@ -41,6 +58,19 @@ def save_flagged(flagged: dict[str, FlaggedEntry], csv_path: Path) -> None:
         writer = csv.writer(handle)
         for path, (tools, sha256) in flagged.items():
             writer.writerow([path, ",".join(tools), sha256])
+
+
+def normalize_flagged_csv(csv_path: Path) -> int:
+    """Rewrite tool names in flagged.csv to lowercase canonical module names."""
+    if not csv_path.is_file():
+        return 0
+
+    flagged = load_flagged(csv_path)
+    if not flagged:
+        return 0
+
+    save_flagged(flagged, csv_path)
+    return len(flagged)
 
 
 def record_flagged(
@@ -58,7 +88,7 @@ def record_flagged(
     When normalize is False, paths are stored verbatim (for registry key paths)
     and no SHA-256 hash is recorded.
     """
-    normalized_tool = tool.strip()
+    normalized_tool = normalize_tool_name(tool)
     if not normalized_tool:
         raise ValueError("tool name must not be empty")
 
@@ -166,6 +196,8 @@ def is_flagged_path_under_target(path_str: str, target_root: Path) -> bool:
 def filter_flagged_for_target(
     flagged: dict[str, FlaggedEntry],
     target: Path | None,
+    *,
+    include_kext: bool = False,
 ) -> dict[str, FlaggedEntry]:
     """Keep only filesystem paths that fall under the provided target."""
     if target is None:
@@ -183,6 +215,7 @@ def filter_flagged_for_target(
         path: entry
         for path, entry in flagged.items()
         if is_flagged_path_under_target(path, target_root)
+        or (include_kext and is_kext_path(path))
     }
 
 
@@ -191,6 +224,7 @@ def prepare_analysis_flagged_csv(
     *,
     source_csv: Path,
     scoped_csv: Path,
+    include_kext: bool = False,
 ) -> tuple[Path, int, int]:
     """Return the flagged CSV analysis modules should read.
 
@@ -202,7 +236,7 @@ def prepare_analysis_flagged_csv(
     if target is None:
         return source_csv, total, total
 
-    filtered = filter_flagged_for_target(flagged, target)
+    filtered = filter_flagged_for_target(flagged, target, include_kext=include_kext)
     scoped_csv.parent.mkdir(parents=True, exist_ok=True)
     save_flagged(filtered, scoped_csv)
     return scoped_csv, len(filtered), total

@@ -8,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TMP_ROOT = ROOT / "tmp"
 DEFAULT_OUTPUT_DIR = ROOT / "output"
+DEFAULT_NAMESPACE = "default_namespace"
 
 
 @dataclass(frozen=True)

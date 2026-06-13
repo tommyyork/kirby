@@ -9,10 +9,13 @@ from pathlib import Path
 from kirby_index import (
     build_hash_cache_from_file_list,
     load_file_list_meta,
+    load_hash_cache,
     publish_cached_file,
+    read_path_list,
     save_file_list_meta,
     sha256_file,
     write_hash_cache,
+    write_path_list,
 )
 from kirby_log import KirbyLogger
 
@@ -129,15 +132,8 @@ def is_kext_path(path_str: str) -> bool:
     return ".kext/" in normalized or normalized.endswith(".kext")
 
 
-def ensure_kext_file_list(
-    tmp_files_path: Path,
-    tmp_meta_path: Path,
-    tmp_hashes_path: Path,
-    log: KirbyLogger | None = None,
-) -> int:
-    if log is None:
-        log = KirbyLogger(True)
-
+def ensure_kext_cache(log: KirbyLogger) -> tuple[Path, Path, int]:
+    """Ensure cache/kext inventory is up to date and return cache file paths."""
     log.step("Checking whether kernel extension inventory is up to date")
     fingerprint = kext_fingerprint()
     stored = load_file_list_meta(KEXT_META_PATH)
@@ -151,31 +147,65 @@ def ensure_kext_file_list(
         if not KEXT_HASHES_PATH.is_file():
             log.step(f"Building missing SHA-256 cache from {KEXT_FILES_PATH}")
             build_hash_cache_from_file_list(KEXT_FILES_PATH, KEXT_HASHES_PATH, log)
-        publish_kext_inventory(
-            KEXT_FILES_PATH,
-            tmp_files_path,
-            KEXT_HASHES_PATH,
-            tmp_hashes_path,
-            KEXT_META_PATH,
-            tmp_meta_path,
-        )
         log.step(f"Kernel extensions unchanged, reusing {KEXT_FILES_PATH} ({file_count} paths)")
         if not log.verbose:
             print(f"[kirby] kext inventory unchanged, reusing cached list ({file_count} paths)")
-        return file_count
+        return KEXT_FILES_PATH, KEXT_HASHES_PATH, file_count
 
     log.step("Building kernel extension file inventory")
     file_count = write_kext_file_list(KEXT_FILES_PATH, KEXT_HASHES_PATH, log)
     save_file_list_meta(KEXT_META_PATH, fingerprint, file_count)
+    log.step(f"Wrote {file_count} kext file path(s) to {KEXT_FILES_PATH}")
+    if not log.verbose:
+        print(f"[kirby] wrote {file_count} kext file path(s) to cached inventory")
+    return KEXT_FILES_PATH, KEXT_HASHES_PATH, file_count
+
+
+def append_kext_to_inventory(
+    tmp_files_path: Path,
+    tmp_hashes_path: Path,
+    log: KirbyLogger,
+) -> int:
+    """Append kernel extension paths from cache/kext/ to an existing tmp inventory."""
+    kext_files, kext_hashes, kext_count = ensure_kext_cache(log)
+    existing_paths = read_path_list(tmp_files_path)
+    existing_set = set(existing_paths)
+    kext_paths = read_path_list(kext_files)
+    new_paths = [path for path in kext_paths if path not in existing_set]
+    if not new_paths:
+        log.step(f"Kernel extension inventory already present ({kext_count} path(s))")
+        return 0
+
+    merged_paths = existing_paths + new_paths
+    write_path_list(tmp_files_path, merged_paths)
+
+    hash_cache = load_hash_cache(tmp_hashes_path) if tmp_hashes_path.is_file() else {}
+    hash_cache.update(load_hash_cache(kext_hashes))
+    entries = [(path, hash_cache.get(path, "")) for path in merged_paths]
+    write_hash_cache(entries, tmp_hashes_path)
+    log.step(
+        f"Appended {len(new_paths)} kernel extension path(s) "
+        f"({len(merged_paths)} total in {tmp_files_path})"
+    )
+    return len(new_paths)
+
+
+def ensure_kext_file_list(
+    tmp_files_path: Path,
+    tmp_meta_path: Path,
+    tmp_hashes_path: Path,
+    log: KirbyLogger | None = None,
+) -> int:
+    if log is None:
+        log = KirbyLogger(True)
+
+    kext_files, kext_hashes, file_count = ensure_kext_cache(log)
     publish_kext_inventory(
-        KEXT_FILES_PATH,
+        kext_files,
         tmp_files_path,
-        KEXT_HASHES_PATH,
+        kext_hashes,
         tmp_hashes_path,
         KEXT_META_PATH,
         tmp_meta_path,
     )
-    log.step(f"Wrote {file_count} kext file path(s) to {KEXT_FILES_PATH}")
-    if not log.verbose:
-        print(f"[kirby] wrote {file_count} kext file path(s) to cached inventory")
     return file_count

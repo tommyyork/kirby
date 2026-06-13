@@ -25,7 +25,7 @@ export BITLOCKER_RECOVERY_PASSWORD='...'
 ./mount_bitlocker.sh
 
 # Scan, then analyze (verbose by default)
-python kirby.py -t /Volumes/bitlocker -e Yara,oletools -a virustotal
+python kirby.py -t /Volumes/bitlocker -n bitlocker -e yara,oletools -a virustotal
 ```
 
 External tools required depend on which modules you enable — see [Prerequisites](#prerequisites).
@@ -35,21 +35,21 @@ External tools required depend on which modules you enable — see [Prerequisite
 ## Kirby CLI
 
 ```
-usage: kirby.py [-h] [-t TARGET | -kext] [-e ENGINES] [-a ANALYSIS] [-r RESCUE] [-n NAME] [-o OUTPUT] [-s]
+usage: kirby.py [-h] [-t TARGET] [-kext] [-e ENGINES] [-a ANALYSIS] [-r RESCUE] [-n NAME] [-o OUTPUT] [-s]
 ```
 
 | Flag | Long form | Required | Default | Description |
 |------|-----------|----------|---------|-------------|
 | `-t` | `--target` | Yes* | — | Scan target: directory, specific file path, disk image, or block device (e.g. `/Volumes/bitlocker`, `/Volumes/Windows/Users/jane/file.exe`) |
-| `-kext` | — | No | off | Special target: enumerate installed kernel extensions on this Mac and pass them to scan engines |
-| `-e` | `--engines` | No* | — | Comma-separated **scan** module names (e.g. `Yara,ClamAV,oletools`) |
+| `-kext` | — | No | off | Also scan installed kernel extensions on this Mac; without `-t`, kexts are the only scan target |
+| `-e` | `--engines` | No* | — | Comma-separated **scan** module names (e.g. `yara,clamav,oletools`) |
 | `-a` | `--analysis` | No* | — | Comma-separated **analysis** module names (e.g. `virustotal`) |
 | `-r` | `--rescue` | No* | — | Comma-separated **rescue** module names (e.g. `simple-rescue`) |
-| `-n` | `--name` | No | derived from target | Target name for this run; working files go in `tmp/<name>/`, reports in `output/<name>/` |
+| `-n` | `--name` | No | `default_namespace` | Namespace for this run; working files go in `tmp/<name>/`, reports in `output/<name>/` |
 | `-o` | `--output` | No | `output/` | Base output directory; reports go in `<output>/<name>/` |
 | `-s` | `--silent` | No | off | Suppress detailed progress logs and tqdm progress bars |
 
-\*At least one of `-e`, `-a`, or `-r` must be provided. When running scan or rescue modules, provide either `-t` or `-kext` (not both).
+\*At least one of `-e`, `-a`, or `-r` must be provided. When running scan or rescue modules, provide `-t`, `-kext`, or both.
 
 Module names are case-insensitive. Scan modules run first, then rescue modules, then analysis modules.
 
@@ -57,9 +57,9 @@ Verbose output (step-by-step logs and progress bars) is the **default**. Pass `-
 
 ### Target naming (`-n`)
 
-Each run uses a target **name** that namespaces both working files and reports. Use `-n` to set it explicitly; otherwise Kirby derives it from the target path by lowercasing and replacing slashes with dashes (e.g. `/Volumes/Windows` → `volumes-windows`, `/dev/disk7s3` → `dev-disk7s3`). With `-kext`, the default name is `kext`. With no target (analysis-only), the default is `analysis` — pass `-n` to match the name used during earlier scan runs.
+Each run uses a **namespace** (`-n`) that groups working files and reports. When `-n` is omitted, Kirby uses `default_namespace` (`tmp/default_namespace/`, `output/default_namespace/`). Pass `-n` explicitly to separate cases — for example `laptop_ssd` for one machine's drive and `usb_stick` for another.
 
-The same name can be reused across multiple mount points or devices. Each scan appends to `tmp/<name>/flagged.csv`, so one named target can accumulate flagged paths from many locations. During analysis, `-t` still filters that list to paths under the provided target (or to the exact file when `-t` is a file path).
+The same namespace can be reused across multiple mount points or devices. Each scan appends to `tmp/<name>/flagged.csv`, so one namespace can accumulate flagged paths from many locations. During analysis, `-t` still filters that list to paths under the provided target (or to the exact file when `-t` is a file path).
 
 ### Single-file targets
 
@@ -73,46 +73,51 @@ python kirby.py -t /Volumes/Windows/Users/riley/Downloads/ChromeSetup.exe -n lap
 python kirby.py -t /Volumes/Windows/Users/riley/Downloads/report.docm -n laptop_ssd -e die,mraptor,oletools
 ```
 
-Use `-n` to keep reports and `flagged.csv` under a familiar target namespace (e.g. `laptop_ssd`) rather than the long derived name from the file path.
+Use `-n` to keep reports and `flagged.csv` under a stable namespace (e.g. `laptop_ssd`) rather than the default `default_namespace`.
 
 ### Examples
 
 ```bash
-# Scan only (reports in output/volumes-bitlocker/)
-python kirby.py -t /Volumes/bitlocker -e Yara,oletools
+# Scan only
+python kirby.py -t /Volumes/bitlocker -n bitlocker -e yara,oletools
 
-# Named target — working files in tmp/laptop_ssd/, reports in output/laptop_ssd/
+# Named namespace — working files in tmp/laptop_ssd/, reports in output/laptop_ssd/
 python kirby.py -t /Volumes/Windows -n laptop_ssd -e detect-it-easy,mraptor,regripper,yara
 
-# Scan a second volume into the same named target (merges into tmp/laptop_ssd/flagged.csv)
+# Scan a second volume into the same namespace (merges into tmp/laptop_ssd/flagged.csv)
 python kirby.py -t /Volumes/OtherDrive -n laptop_ssd -e yara
 
 # Analyze only paths under /Volumes/Windows from that shared flag list
 python kirby.py -t /Volumes/Windows -n laptop_ssd -a virustotal
 
 # Full pipeline in one invocation
-python kirby.py -t /Volumes/bitlocker -e Yara,oletools -a virustotal
+python kirby.py -t /Volumes/bitlocker -n bitlocker -e yara,oletools -a virustotal
 
 # Rescue user documents from a Windows volume (macro-checked Office files)
 python kirby.py -t /Volumes/Windows -n laptop_ssd -r simple-rescue
 
-# Scan installed kernel extensions on this Mac (reports in output/kext/)
-python kirby.py -kext -e detect-it-easy,Yara
+# Scan installed kernel extensions on this Mac only
+python kirby.py -kext -n kext -e detect-it-easy,yara
+
+# Scan a mounted volume and local kernel extensions in one run
+python kirby.py -t /Volumes/Windows -kext -n laptop_ssd -e yara,clamav
 ```
 
 Each module produces `{module}.md` under the target output directory (e.g. `output/laptop_ssd/yara.md`, `output/laptop_ssd/virustotal.md`).
 
-### `-kext` special target
+### `-kext` kernel extension scanning
 
-Use `-kext` instead of `-t` to scan kernel extensions installed on the local macOS system. Kirby enumerates `.kext` bundles under:
+Use `-kext` to include kernel extensions installed on the local macOS system. Kirby enumerates `.kext` bundles under:
 
 - `/Library/Extensions`
 - `/System/Library/Extensions`
 - `/Library/Apple/System/Library/Extensions`
 
-It writes every file inside those bundles to `tmp/<name>/all_files` (with SHA-256 hashes in `tmp/<name>/sha256_hashes`) and passes that inventory to scan engines that read the file list (`detect-it-easy`, `oletools`, `mraptor`, etc.). YARA scans those kext directories recursively. The inventory is cached under `cache/kext/` and reused until bundle paths or modification times change.
+**`-kext` alone** scans only those kext bundles. Kirby writes every file inside them to `tmp/<name>/all_files` (use `-n kext` or another namespace; otherwise `default_namespace`), with SHA-256 hashes in `tmp/<name>/sha256_hashes`. The inventory is cached under `cache/kext/` and reused until bundle paths or modification times change.
 
-`-kext` cannot be combined with `-t`.
+**`-kext` with `-t`** scans the `-t` target first, then appends the kext inventory to the same `tmp/<name>/all_files`. Inventory-driven engines (`detect-it-easy`, `oletools`, `mraptor`, etc.) scan the combined list. Path-based engines (`yara`, `clamav`) scan the `-t` target and the kext directories separately. Analysis with `-a` includes flagged paths from both the target and kexts when `-kext` is set.
+
+Registry-oriented modules such as `regripper` and rescue modules such as `simple-rescue` operate on the `-t` target only; kext paths in the merged inventory are ignored when they fall outside the mounted volume.
 
 ---
 
@@ -134,7 +139,7 @@ Scan modules that flag suspicious files append to a shared CSV:
 
 If multiple scan modules flag the same path, Kirby merges module names into the second column rather than duplicating rows. Scanning different volumes with the same `-n` merges into the same `flagged.csv`.
 
-Analysis modules read from `tmp/<name>/flagged.csv`. When `-t` is provided, only paths under that target are analyzed (written to `tmp/<name>/flagged-scoped.csv` for the run).
+Analysis modules read from `tmp/<name>/flagged.csv`. When `-t` is provided, only paths under that target are analyzed (written to `tmp/<name>/flagged-scoped.csv` for the run). When `-kext` is also set, flagged kernel extension paths are included in that scoped analysis list.
 
 ---
 
@@ -158,7 +163,7 @@ Signature-based scanning using [Neo23x0's signature-base](https://github.com/Neo
 
 **Flagged files (`tmp/<name>/flagged.csv`)**
 
-- Every file that matches at least one YARA rule (tool name: `Yara`)
+- Every file that matches at least one YARA rule (tool name: `yara`)
 
 **Result filtering**
 
@@ -354,12 +359,12 @@ Signature data is cloned separately under `modules/scan/detect-it-easy/Detect-it
 
 ### ClamAV
 
-Antivirus scanning via ClamAV `clamdscan` against the scan target (directory, single file, or kext roots).
+Antivirus scanning via ClamAV `clamdscan` against the scan target (directory, single file, kext roots, or a combination of `-t` and `-kext`).
 
 **What it does**
 
 - Starts a dedicated Kirby `clamd` instance using `modules/scan/clamav/clamd.conf` (not Homebrew's `/opt/homebrew/etc/clamav/clamd.conf`); the active config is written to `modules/scan/clamav/run/clamd.conf` with the `database` path from `clamav.conf`
-- Runs `clamdscan --fdpass` against `-t` (or each kext root when using `-kext`)
+- Runs `clamdscan --fdpass` against `-t` (or each kext root when using `-kext`, or both when `-t` and `-kext` are combined)
 - Writes the full scan transcript to `output/<name>/clamdscan.log`
 - Flags every file reported as `FOUND`
 
@@ -370,7 +375,7 @@ Antivirus scanning via ClamAV `clamdscan` against the scan target (directory, si
 
 **Flagged files (`tmp/<name>/flagged.csv`)**
 
-- Every file where clamdscan reports a virus signature (tool name: `ClamAV`)
+- Every file where clamdscan reports a virus signature (tool name: `clamav`)
 
 **Configuration**
 
@@ -531,17 +536,17 @@ Requires `sudo` when reading raw block devices. Verify the partition with `disku
 
 ```bash
 # Use TARGET_DEVICE from sleuthkit.conf
-.venv/bin/python kirby.py -t /Volumes/bitlocker -a sleuthkit-mactime
+.venv/bin/python kirby.py -t /Volumes/bitlocker -n bitlocker -a sleuthkit-mactime
 
 # Or pass the block device directly
-.venv/bin/python kirby.py -t /dev/disk7s3 -a sleuthkit-mactime
+.venv/bin/python kirby.py -t /dev/disk7s3 -n bitlocker -a sleuthkit-mactime
 ```
 
 ---
 
 ## Rescue modules
 
-Rescue modules live under `modules/rescue/` and are invoked with `-r`. They operate on the same file inventory as scan modules (`tmp/<name>/all_files`) and require a mounted target (`-t` or `-kext`).
+Rescue modules live under `modules/rescue/` and are invoked with `-r`. They operate on the same file inventory as scan modules (`tmp/<name>/all_files`) and require a mounted target (`-t`). `-kext` alone is not sufficient for rescue modules.
 
 ### simple-rescue
 
@@ -646,12 +651,12 @@ pip install -r requirements.txt
 
 | Module | Type | External dependency |
 |--------|------|---------------------|
-| Yara | Scan | `yara`, `yarac` |
+| yara | Scan | `yara`, `yarac` |
 | oletools | Scan | Included via pip |
 | mraptor | Scan | Included via pip (oletools) |
-| RegRipper | Scan | `perl`, `cpan` (first-run setup) |
+| regripper | Scan | `perl`, `cpan` (first-run setup) |
 | detect-it-easy | Scan | `diec` (official pkg or local build via `build.sh`) |
-| ClamAV | Scan | `clamav`, `freshclam`; Kirby uses `modules/scan/clamav/clamd.conf` |
+| clamav | Scan | `clamav`, `freshclam`; Kirby uses `modules/scan/clamav/clamd.conf` |
 | VirusTotal | Analysis | VirusTotal API key in `.env` |
 | signatures | Analysis | `codesign`, optional `osslsigncode`, `exiftool`, `strings` |
 | sleuthkit-mactime | Analysis | Local Sleuth Kit build; `sudo` for raw device access |
