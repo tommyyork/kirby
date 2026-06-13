@@ -1,0 +1,31 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Runtime / generated data
+tmp/
+cache/
+output/
+
+# Logs
+*.log
+initial_log.txt
+
+# macOS
+.DS_Store
+
+# Build artifacts (local builds from submodule sources)
+dislocker/build/
+modules/analysis/sleuthkit-mactime/install/
+modules/scan/detect-it-easy/DIE-engine/build/
+
+# YARA compile cache
+modules/scan/yara/kirby-compiled.yarc
