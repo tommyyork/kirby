@@ -6,7 +6,7 @@ import csv
 from collections.abc import Iterable
 from pathlib import Path
 
-from kirby_index import load_hash_cache, lookup_sha256
+from kirby_index import load_hash_cache, lookup_sha256, sha256_file
 from kirby_kext import is_kext_path, is_kext_target
 from kirby_target import resolve_flagged_filter_root
 
@@ -97,18 +97,48 @@ def backfill_flagged_hashes(
     hashes_path: Path | None = None,
 ) -> int:
     """Fill missing SHA-256 values in flagged.csv from the per-target hash cache."""
+    return fill_flagged_file_hashes(
+        csv_path,
+        hashes_path=hashes_path,
+        compute_on_disk=False,
+    )
+
+
+def fill_flagged_file_hashes(
+    csv_path: Path,
+    *,
+    paths: Iterable[str | Path] | None = None,
+    hashes_path: Path | None = None,
+    compute_on_disk: bool = False,
+) -> int:
+    """Fill missing SHA-256 values for filesystem paths in flagged.csv."""
     hash_cache = load_hash_cache(hashes_path or csv_path.parent / "sha256_hashes")
     flagged = load_flagged(csv_path)
+    targets = {_normalize_path(path) for path in paths} if paths is not None else None
     updated = 0
 
     for path, (tools, sha256) in flagged.items():
+        if targets is not None and path not in targets:
+            continue
         if sha256:
             continue
-        if not Path(path).is_file():
+        if not path.startswith("/"):
             continue
+
+        file_path = Path(path)
+        if not file_path.is_file():
+            continue
+
         digest = lookup_sha256(path, hash_cache)
+        if not digest and compute_on_disk:
+            try:
+                digest = sha256_file(file_path)
+            except OSError:
+                continue
+
         if not digest:
             continue
+
         flagged[path] = (tools, digest)
         updated += 1
 

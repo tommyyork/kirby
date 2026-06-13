@@ -354,24 +354,49 @@ Signature data is cloned separately under `modules/scan/detect-it-easy/Detect-it
 
 ### ClamAV
 
-Antivirus scanning via ClamAV. **Not yet implemented** — the module is a placeholder that writes an empty report.
+Antivirus scanning via ClamAV `clamdscan` against the scan target (directory, single file, or kext roots).
+
+**What it does**
+
+- Starts a dedicated Kirby `clamd` instance using `modules/scan/clamav/clamd.conf` (not Homebrew's `/opt/homebrew/etc/clamav/clamd.conf`); the active config is written to `modules/scan/clamav/run/clamd.conf` with the `database` path from `clamav.conf`
+- Runs `clamdscan --fdpass` against `-t` (or each kext root when using `-kext`)
+- Writes the full scan transcript to `output/<name>/clamdscan.log`
+- Flags every file reported as `FOUND`
 
 **Output**
 
-- `output/<name>/clamav.md` — currently empty
+- `output/<name>/clamav.md` — summary table of detections
+- `output/<name>/clamdscan.log` — full clamdscan log for the run
 
-**Flagged files**
+**Flagged files (`tmp/<name>/flagged.csv`)**
 
-- None (flagging hook is in place for future use; tool name will be `ClamAV`)
+- Every file where clamdscan reports a virus signature (tool name: `ClamAV`)
 
-**Configuration** (`modules/scan/clamav/clamav.conf`)
+**Configuration**
+
+Module settings (`modules/scan/clamav/clamav.conf`):
 
 | Option | Description |
 |--------|-------------|
-| `database` | ClamAV signature database path |
-| `recursive` | Intended for recursive scanning when implemented |
+| `database` | ClamAV signature database directory (default: `/opt/homebrew/var/lib/clamav`) |
+| `clamd_config` | Path to the Kirby clamd config, relative to the module directory (default: `clamd.conf`) |
 
-**Prerequisites (planned):** ClamAV installed and signatures updated (`brew install clamav`)
+Daemon settings (`modules/scan/clamav/clamd.conf`):
+
+| Setting | Description |
+|---------|-------------|
+| `DatabaseDirectory` | Signature database path (should match `database` in `clamav.conf`) |
+| `TCPSocket` / `TCPAddr` | Local Kirby clamd listener (default: `127.0.0.1:13374`) |
+| `MaxScanSize` / `MaxFileSize` | Archive and per-file scan limits |
+
+**Prerequisites:** ClamAV installed and signatures updated:
+
+```bash
+brew install clamav
+freshclam   # or: sudo freshclam
+```
+
+The module starts `clamd` automatically when it is not already listening on the Kirby socket/port.
 
 ---
 
@@ -591,6 +616,7 @@ python kirby.py -t /Volumes/Windows -n laptop_ssd -r simple-rescue
 | `tmp/<name>/flagged.csv` | Consolidated list of flagged paths and which scan modules flagged them |
 | `tmp/<name>/flagged-scoped.csv` | Target-filtered subset of `flagged.csv` used during analysis |
 | `tmp/<name>/virustotal-hashes` | SHA256 hashes of flagged files analyzed by VirusTotal |
+| `output/<name>/clamdscan.log` | Full ClamAV clamdscan transcript |
 | `cache/virustotal-cache.db` | VirusTotal API response cache |
 | `output/<name>/sleuthkit-mactime.md` | MAC-time timeline from Sleuth Kit |
 
@@ -625,7 +651,7 @@ pip install -r requirements.txt
 | mraptor | Scan | Included via pip (oletools) |
 | RegRipper | Scan | `perl`, `cpan` (first-run setup) |
 | detect-it-easy | Scan | `diec` (official pkg or local build via `build.sh`) |
-| ClamAV | Scan | Not yet used |
+| ClamAV | Scan | `clamav`, `freshclam`; Kirby uses `modules/scan/clamav/clamd.conf` |
 | VirusTotal | Analysis | VirusTotal API key in `.env` |
 | signatures | Analysis | `codesign`, optional `osslsigncode`, `exiftool`, `strings` |
 | sleuthkit-mactime | Analysis | Local Sleuth Kit build; `sudo` for raw device access |
@@ -649,7 +675,7 @@ modules/
     mraptor/           # Malicious macro detection (MacroRaptor)
     regripper/        # Windows registry persistence analysis
     detect-it-easy/   # Detect It Easy packer/protector scanning
-    clamav/           # ClamAV (placeholder)
+    clamav/           # ClamAV clamdscan integration
   analysis/
     virustotal/       # VirusTotal hash enrichment
     signatures/       # PE / Authenticode signature verification

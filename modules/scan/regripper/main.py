@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from kirby_flagged import record_flagged
+from kirby_flagged import fill_flagged_file_hashes, record_flagged
 from kirby_log import KirbyLogger
 from kirby_report import format_scan_report_header
 
@@ -826,6 +826,15 @@ def run(
             f"Updated {updated} path(s) in {flagged_csv_path} "
             f"({len(filesystem_paths)} file, {len(registry_paths)} registry)"
         )
+
+    if filesystem_paths:
+        hashed = fill_flagged_file_hashes(
+            flagged_csv_path,
+            paths=filesystem_paths,
+            compute_on_disk=True,
+        )
+        if hashed:
+            log.step(f"Computed SHA-256 for {hashed} flagged file(s) in {flagged_csv_path}")
 
     log.step(f"Writing report to {output}")
     report = format_report(

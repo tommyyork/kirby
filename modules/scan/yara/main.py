@@ -278,7 +278,7 @@ def run(
         matches, stderr, _returncode = run_yara_kext(compiled, recursive, log)
     elif target.is_file():
         log.step("Scanning single file target")
-        result = run_yara(compiled, target, recursive=False, log)
+        result = run_yara(compiled, target, recursive=False, log=log)
         if result.returncode not in (0, 1):
             raise RuntimeError(result.stderr.strip() or f"yara exited with code {result.returncode}")
         matches = parse_matches(result.stdout)

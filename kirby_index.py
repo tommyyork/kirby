@@ -253,6 +253,32 @@ def save_file_list_meta(meta_path: Path, identity: dict[str, str], file_count: i
     )
 
 
+def save_published_meta(
+    meta_path: Path,
+    *,
+    identity: dict[str, str],
+    published_target: Path,
+    published_count: int,
+    cached_count: int,
+    cache_files: Path,
+) -> None:
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(
+        json.dumps(
+            {
+                "fingerprint": identity,
+                "published_target": str(published_target),
+                "published_count": published_count,
+                "cached_count": cached_count,
+                "cached_inventory": str(cache_files),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def publish_cached_file(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -311,6 +337,14 @@ def read_path_list(files_path: Path) -> list[str]:
     ]
 
 
+def count_indexed_paths(files_path: Path) -> int:
+    if not files_path.is_file():
+        return 0
+    if files_path.is_symlink():
+        return count_indexed_paths(files_path.resolve())
+    return len(read_path_list(files_path))
+
+
 def write_path_list(files_path: Path, paths: list[str]) -> int:
     files_path.parent.mkdir(parents=True, exist_ok=True)
     files_path.write_text("\n".join(paths) + ("\n" if paths else ""), encoding="utf-8")
@@ -345,6 +379,8 @@ def publish_filtered_inventory(
     meta_source: Path,
     destination_meta: Path,
     target: Path,
+    *,
+    identity: dict[str, str],
 ) -> int:
     paths = filter_paths_for_target(read_path_list(source_files), target)
     allowed_paths = set(paths)
@@ -353,9 +389,114 @@ def publish_filtered_inventory(
     hash_entries = filter_hash_cache_for_target(hashes_source, allowed_paths)
     write_hash_cache(hash_entries, destination_hashes)
 
-    destination_meta.parent.mkdir(parents=True, exist_ok=True)
-    destination_meta.write_text(meta_source.read_text(encoding="utf-8"), encoding="utf-8")
+    cached_count = count_indexed_paths(source_files)
+    save_published_meta(
+        destination_meta,
+        identity=identity,
+        published_target=target,
+        published_count=len(paths),
+        cached_count=cached_count,
+        cache_files=source_files,
+    )
     return len(paths)
+
+
+def diagnose_inventory_cache(
+    files_path: Path,
+    meta_path: Path,
+    identity: dict[str, str],
+) -> str | None:
+    """Return a human-readable reason when a cache entry cannot be reused."""
+    if not files_path.is_file():
+        return "cache file list is missing"
+
+    stored = load_file_list_meta(meta_path)
+    if stored is None:
+        return "cache metadata is missing or unreadable"
+
+    stored_fingerprint = stored.get("fingerprint")
+    if not isinstance(stored_fingerprint, dict):
+        return "cache metadata has no fingerprint"
+
+    if not fingerprints_match_identity(stored_fingerprint, identity):
+        return "cache fingerprint does not match the current volume identity"
+
+    stored_count = int(stored.get("file_count", 0))
+    actual_count = count_indexed_paths(files_path)
+    if stored_count != actual_count:
+        return (
+            f"cache file_count mismatch (meta={stored_count}, "
+            f"all_files={actual_count})"
+        )
+
+    return None
+
+
+def invalidate_inventory_cache(
+    files_path: Path,
+    meta_path: Path,
+    log: KirbyLogger,
+    reason: str,
+) -> None:
+    log.step(f"Invalidating volume cache at {files_path.parent}: {reason}")
+    hashes_path = files_path.parent / "sha256_hashes"
+    for path in (files_path, meta_path, hashes_path):
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            raise RuntimeError(f"Expected inventory file, found directory: {path}")
+
+
+def log_inventory_diagnostics(
+    *,
+    tmp_files_path: Path,
+    tmp_meta_path: Path,
+    cache_files: Path | None,
+    cache_meta: Path | None,
+    target: Path,
+    mount_point: Path,
+    log: KirbyLogger,
+) -> None:
+    tmp_count = count_indexed_paths(tmp_files_path)
+    tmp_meta = load_file_list_meta(tmp_meta_path) if tmp_meta_path.is_file() else None
+    cached_count = count_indexed_paths(cache_files) if cache_files is not None else 0
+
+    scope_label = "mount root" if target_scope_is_mount_root(target, mount_point) else str(target)
+    log.step(
+        f"Inventory diagnostics: published tmp/all_files has {tmp_count} path(s) "
+        f"for scope `{scope_label}`"
+    )
+
+    if cache_files is not None:
+        cache_issue = (
+            diagnose_inventory_cache(cache_files, cache_meta, volume_identity(target))
+            if cache_meta is not None
+            else "cache metadata is missing"
+        )
+        if cache_issue:
+            log.step(
+                f"Volume cache at {cache_files} lists {cached_count} path(s) "
+                f"but is not reusable ({cache_issue})"
+            )
+        else:
+            meta_count = int((load_file_list_meta(cache_meta) or {}).get("file_count", cached_count))
+            log.step(
+                f"Volume cache at {cache_files} is valid with {cached_count} path(s) "
+                f"(meta file_count={meta_count})"
+            )
+
+    if tmp_meta is not None:
+        published_count = tmp_meta.get("published_count")
+        cached_total = tmp_meta.get("cached_count")
+        if published_count is not None and cached_total is not None:
+            log.step(
+                f"Previous tmp/all_files.meta recorded {published_count} published path(s) "
+                f"from a volume cache of {cached_total}"
+            )
+        elif "file_count" in tmp_meta:
+            log.step(
+                f"Previous tmp/all_files.meta recorded file_count={tmp_meta.get('file_count')}"
+            )
 
 
 def resolve_inventory_cache(
@@ -388,6 +529,9 @@ def reuse_cached_inventory(
     identity: dict[str, str],
     log: KirbyLogger,
 ) -> int:
+    cached_total = load_cached_inventory(cache_files, cache_meta, identity) or count_indexed_paths(
+        cache_files
+    )
     ensure_hash_cache(cache_files, cache_hashes, log)
     scoped_count = publish_inventory_for_target(
         cache_files,
@@ -398,16 +542,17 @@ def reuse_cached_inventory(
         tmp_meta_path,
         target=target,
         mount_point=mount_point,
+        identity=identity,
     )
-    total_count = load_cached_inventory(cache_files, cache_meta, identity) or scoped_count
     log.step(
         f"Volume unchanged, reusing {cache_files} "
-        f"({scoped_count} scoped path(s), {total_count} cached path(s))"
+        f"({scoped_count} scoped path(s) published to tmp/all_files, "
+        f"{cached_total} path(s) in volume cache)"
     )
     if not log.verbose:
         print(
             f"[kirby] volume unchanged, reusing cached inventory "
-            f"({scoped_count} scoped path(s))"
+            f"({scoped_count} scoped / {cached_total} cached path(s))"
         )
     return scoped_count
 
@@ -417,25 +562,12 @@ def load_cached_inventory(
     meta_path: Path,
     identity: dict[str, str],
 ) -> int | None:
-    if not files_path.is_file():
+    if diagnose_inventory_cache(files_path, meta_path, identity) is not None:
         return None
-
     stored = load_file_list_meta(meta_path)
     if stored is None:
         return None
-
-    stored_fingerprint = stored.get("fingerprint")
-    if not isinstance(stored_fingerprint, dict):
-        return None
-    if not fingerprints_match_identity(stored_fingerprint, identity):
-        return None
-
-    stored_count = int(stored.get("file_count", 0))
-    actual_count = len(read_path_list(files_path))
-    if stored_count != actual_count:
-        return None
-
-    return stored_count
+    return count_indexed_paths(files_path)
 
 
 def publish_inventory_for_target(
@@ -448,6 +580,7 @@ def publish_inventory_for_target(
     *,
     target: Path,
     mount_point: Path,
+    identity: dict[str, str],
 ) -> int:
     if target_scope_is_mount_root(target, mount_point):
         publish_inventory(
@@ -458,7 +591,7 @@ def publish_inventory_for_target(
             meta_source,
             destination_meta,
         )
-        return len(read_path_list(source_files))
+        return count_indexed_paths(source_files)
 
     return publish_filtered_inventory(
         source_files,
@@ -468,6 +601,7 @@ def publish_inventory_for_target(
         meta_source,
         destination_meta,
         target,
+        identity=identity,
     )
 
 
@@ -566,59 +700,67 @@ def legacy_fingerprint_from_stored(stored_fingerprint: dict) -> dict[str, str] |
     return volume_fingerprint(target)
 
 
+def try_migrate_legacy_layout(
+    mount_point: Path,
+    identity: dict[str, str],
+    destination: Path,
+    hashes_destination: Path,
+    meta_path: Path,
+    log: KirbyLogger,
+) -> int | None:
+    """Promote the largest valid legacy per-scope cache into the mount-root cache."""
+    volume_dir = CACHE_DIR / volume_slug(mount_point)
+    if not volume_dir.is_dir():
+        return None
+
+    best: tuple[Path, Path, Path, int] | None = None
+    for child in sorted(volume_dir.iterdir()):
+        if not child.is_dir() or child.name == "_root":
+            continue
+        files_path = child / "all_files"
+        meta_path_legacy = child / "meta.json"
+        count = load_cached_inventory(files_path, meta_path_legacy, identity)
+        if count is None:
+            continue
+        if best is None or count > best[3]:
+            best = (files_path, child / "sha256_hashes", meta_path_legacy, count)
+
+    if best is None:
+        return None
+
+    legacy_files, legacy_hashes, legacy_meta, file_count = best
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(legacy_files.read_text(encoding="utf-8"), encoding="utf-8")
+    if legacy_hashes.is_file():
+        hashes_destination.parent.mkdir(parents=True, exist_ok=True)
+        hashes_destination.write_text(legacy_hashes.read_text(encoding="utf-8"), encoding="utf-8")
+    save_file_list_meta(meta_path, identity, file_count)
+    log.step(
+        f"Migrated legacy inventory from {legacy_files.parent} to {destination} "
+        f"({file_count} paths)"
+    )
+    return file_count
+
+
 def try_import_legacy_inventory(
     target: Path,
     identity: dict[str, str],
     destination: Path,
     hashes_destination: Path,
     meta_path: Path,
-    legacy_files_path: Path,
-    legacy_meta_path: Path,
     log: KirbyLogger,
 ) -> int | None:
-    if not legacy_files_path.is_file() or not legacy_meta_path.is_file():
-        return None
-
     mount_point = Path(identity["mount_point"])
     if not target_scope_is_mount_root(target, mount_point):
         return None
-
-    stored = load_file_list_meta(legacy_meta_path)
-    if stored is None:
-        return None
-
-    stored_fingerprint = stored.get("fingerprint")
-    if not isinstance(stored_fingerprint, dict):
-        return None
-
-    if fingerprints_match_identity(stored_fingerprint, identity):
-        pass
-    else:
-        migrated = legacy_fingerprint_from_stored(stored_fingerprint)
-        if migrated is None or not fingerprints_match_identity(migrated, identity):
-            return None
-
-    legacy_paths = read_path_list(legacy_files_path)
-    if not legacy_paths:
-        return None
-
-    stored_count = int(stored.get("file_count", 0))
-    if stored_count and stored_count != len(legacy_paths):
-        return None
-
-    file_count = len(legacy_paths)
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(legacy_files_path.read_text(encoding="utf-8"), encoding="utf-8")
-
-    legacy_hashes_path = legacy_files_path.parent / "sha256_hashes"
-    if legacy_hashes_path.is_file():
-        hashes_destination.parent.mkdir(parents=True, exist_ok=True)
-        hashes_destination.write_text(legacy_hashes_path.read_text(encoding="utf-8"), encoding="utf-8")
-
-    save_file_list_meta(meta_path, identity, file_count)
-    log.step(f"Migrated legacy inventory to {destination} ({file_count} paths)")
-    return file_count
+    return try_migrate_legacy_layout(
+        mount_point,
+        identity,
+        destination,
+        hashes_destination,
+        meta_path,
+        log,
+    )
 
 
 def ensure_hash_cache(
@@ -653,9 +795,22 @@ def ensure_single_file_list(
     if not resolved.is_file():
         raise FileNotFoundError(f"File target not found or not a regular file: {target}")
 
+    path_str = str(resolved)
     fingerprint = single_file_fingerprint(resolved)
     stored = load_file_list_meta(tmp_meta_path)
-    path_str = str(resolved)
+
+    mount_point = resolve_mount_point(resolved)
+    identity = volume_identity(resolved)
+    cache_files, cache_hashes, cache_meta = inventory_paths(mount_point)
+    log_inventory_diagnostics(
+        tmp_files_path=tmp_files_path,
+        tmp_meta_path=tmp_meta_path,
+        cache_files=cache_files if cache_files.is_file() else None,
+        cache_meta=cache_meta if cache_meta.is_file() else None,
+        target=resolved,
+        mount_point=mount_point,
+        log=log,
+    )
 
     if (
         tmp_files_path.is_file()
@@ -666,6 +821,27 @@ def ensure_single_file_list(
         if not log.verbose:
             print(f"[kirby] reusing single-file inventory for {resolved.name}")
         return 1
+
+    if load_cached_inventory(cache_files, cache_meta, identity) is not None:
+        cached_paths = read_path_list(cache_files)
+        if path_str in cached_paths:
+            hash_entries = filter_hash_cache_for_target(cache_hashes, {path_str})
+            digest = hash_entries[0][1] if hash_entries else ""
+            if not digest:
+                try:
+                    digest = sha256_file(resolved)
+                except OSError as exc:
+                    log.step(f"Could not hash {resolved}: {exc}")
+            write_path_list(tmp_files_path, [path_str])
+            write_hash_cache([(path_str, digest)], tmp_hashes_path)
+            save_file_list_meta(tmp_meta_path, fingerprint, 1)
+            log.step(
+                f"Published single file from volume cache "
+                f"({count_indexed_paths(cache_files)} path(s) in cache)"
+            )
+            if not log.verbose:
+                print(f"[kirby] published single file from volume cache")
+            return 1
 
     log.step(f"Indexing single file target: {resolved}")
     digest = ""
@@ -705,6 +881,21 @@ def ensure_file_list(
                 f"Scan scope `{scan_root}` will filter cached mount inventory for {target}"
             )
 
+    log_inventory_diagnostics(
+        tmp_files_path=tmp_files_path,
+        tmp_meta_path=tmp_meta_path,
+        cache_files=destination if destination.is_file() else None,
+        cache_meta=meta_path if meta_path.is_file() else None,
+        target=target,
+        mount_point=mount_point,
+        log=log,
+    )
+
+    if destination.is_file():
+        cache_issue = diagnose_inventory_cache(destination, meta_path, identity)
+        if cache_issue:
+            invalidate_inventory_cache(destination, meta_path, log, cache_issue)
+
     cached = resolve_inventory_cache(mount_point, scan_root, identity)
     if cached is not None:
         cache_files, cache_hashes, cache_meta = cached
@@ -727,8 +918,6 @@ def ensure_file_list(
         destination,
         hashes_path,
         meta_path,
-        tmp_files_path,
-        tmp_meta_path,
         log,
     )
     if migrated_count is not None:
@@ -758,6 +947,7 @@ def ensure_file_list(
         tmp_meta_path,
         target=target,
         mount_point=mount_point,
+        identity=identity,
     )
     log.step(
         f"Wrote {file_count} path(s) to {destination} "
