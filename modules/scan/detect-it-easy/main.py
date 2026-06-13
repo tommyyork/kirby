@@ -60,11 +60,14 @@ def flag_types(config: configparser.ConfigParser) -> set[str]:
     return types
 
 
-def config_csv_set(config: configparser.ConfigParser, key: str) -> set[str]:
+def optional_config_csv_set(config: configparser.ConfigParser, key: str) -> set[str]:
+    """Parse an optional comma-separated config value; empty or missing means no entries."""
     if not config.has_option("detect-it-easy", key):
         return set()
-    raw = config.get("detect-it-easy", key)
-    return {item.strip() for item in raw.split(",") if item.strip()}
+    raw = config.get("detect-it-easy", key, fallback="")
+    if raw is None:
+        return set()
+    return {item.strip() for item in str(raw).split(",") if item.strip()}
 
 
 def config_bool(config: configparser.ConfigParser, key: str, default: bool = False) -> bool:
@@ -242,7 +245,6 @@ def suspicious_detections(
     *,
     ignore_names: set[str],
     ignore_heuristic_names: set[str],
-    allow_heuristic_names: set[str],
     require_non_heuristic: bool,
     skip_authenticode_heuristic_only: bool,
 ) -> list[dict[str, str]]:
@@ -262,19 +264,12 @@ def suspicious_detections(
 
     if require_non_heuristic:
         has_signature_hit = any(not is_heuristic_detection(row) for row in hits)
-        has_allowed_heuristic = any(
-            is_heuristic_detection(row) and row.get("name", "") in allow_heuristic_names
-            for row in hits
-        )
-        if not has_signature_hit and not has_allowed_heuristic:
+        if not has_signature_hit:
             return []
 
     if skip_authenticode_heuristic_only:
         heuristic_only = all(is_heuristic_detection(row) for row in hits)
-        allowed_heuristic = any(
-            row.get("name", "") in allow_heuristic_names for row in hits
-        )
-        if heuristic_only and not allowed_heuristic and has_authenticode_signature(detections):
+        if heuristic_only and has_authenticode_signature(detections):
             return []
 
     return hits
@@ -359,9 +354,8 @@ def run(
     flagged_csv_path = flagged_csv or file_list_path.parent / "flagged.csv"
     extensions = eligible_extensions(settings)
     flagged_types = flag_types(settings)
-    ignore_names = config_csv_set(settings, "ignore_names")
-    ignore_heuristic_names = config_csv_set(settings, "ignore_heuristic_names")
-    allow_heuristic_names = config_csv_set(settings, "allow_heuristic_names")
+    ignore_names = optional_config_csv_set(settings, "ignore_names")
+    ignore_heuristic_names = optional_config_csv_set(settings, "ignore_heuristic_names")
     require_non_heuristic = config_bool(settings, "require_non_heuristic", default=True)
     skip_authenticode_heuristic_only = config_bool(
         settings,
@@ -381,14 +375,18 @@ def run(
     )
     log.step(f"Flagging on detection types: {', '.join(sorted(flagged_types))}")
     if require_non_heuristic:
-        log.step("Requiring at least one non-heuristic detection (or allow_heuristic_names match)")
+        log.step("Requiring at least one non-heuristic detection")
     if ignore_names:
         log.step("Ignoring detection names: " + ", ".join(sorted(ignore_names)))
+    else:
+        log.step("Not ignoring any detection names")
     if ignore_heuristic_names:
         log.step(
             "Ignoring heuristic names: "
             + ", ".join(sorted(ignore_heuristic_names))
         )
+    else:
+        log.step("Not ignoring any heuristic detection names")
     if skip_authenticode_heuristic_only:
         log.step("Skipping heuristic-only hits on Authenticode-signed files")
 
@@ -414,7 +412,6 @@ def run(
             flagged_types,
             ignore_names=ignore_names,
             ignore_heuristic_names=ignore_heuristic_names,
-            allow_heuristic_names=allow_heuristic_names,
             require_non_heuristic=require_non_heuristic,
             skip_authenticode_heuristic_only=skip_authenticode_heuristic_only,
         )
