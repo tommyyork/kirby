@@ -16,10 +16,23 @@ if str(ROOT) not in sys.path:
 from kirby_flagged import load_flagged
 from kirby_log import KirbyLogger
 from kirby_report import format_config_lines, scan_timestamp
+from kirby_tool_errors import check_command_result
 
 MODULE_DIR = Path(__file__).resolve().parent
 CONFIG_SECTION = "signatures"
 TOOL_NAMES = ("codesign", "osslsigncode", "exiftool", "strings")
+
+MACHO_MAGICS = frozenset(
+    {
+        b"\xfe\xed\xfa\xce",  # MH_MAGIC
+        b"\xce\xfa\xed\xfe",  # MH_CIGAM
+        b"\xfe\xed\xfa\xcf",  # MH_MAGIC_64
+        b"\xcf\xfa\xed\xfe",  # MH_CIGAM_64
+        b"\xca\xfe\xba\xbe",  # FAT_MAGIC
+        b"\xbe\xba\xfe\xca",  # FAT_CIGAM
+    }
+)
+MACOS_BUNDLE_MACOS_DIR = "/Contents/MacOS/"
 
 
 def load_config(config_path: Path) -> configparser.ConfigParser:
@@ -114,6 +127,49 @@ def read_flagged_executables(
     return executables
 
 
+def read_header(path: Path, size: int) -> bytes:
+    with path.open("rb") as handle:
+        return handle.read(size)
+
+
+def is_pe_executable(path: Path, windows_extensions: set[str]) -> bool:
+    if path.suffix.lower() in windows_extensions:
+        return True
+    try:
+        return read_header(path, 2)[:2] == b"MZ"
+    except OSError:
+        return False
+
+
+def is_macho_executable(path: Path) -> bool:
+    if path.suffix.lower() == ".dylib":
+        return True
+    if path.is_file() and not path.suffix and MACOS_BUNDLE_MACOS_DIR in path.as_posix():
+        return True
+    try:
+        return read_header(path, 4) in MACHO_MAGICS
+    except OSError:
+        return False
+
+
+def signature_platform(path: Path, windows_extensions: set[str]) -> str:
+    pe = is_pe_executable(path, windows_extensions)
+    macho = is_macho_executable(path)
+    if pe and not macho:
+        return "windows"
+    if macho and not pe:
+        return "macos"
+    if pe:
+        return "windows"
+    if macho:
+        return "macos"
+    return "unknown"
+
+
+def skipped_signature_section(tool: str, reason: str) -> str:
+    return f"#### {tool}\n\n_{reason}_"
+
+
 def run_codesign(path: Path, tool: str | None) -> tuple[bool, str]:
     if tool is None:
         return False, "codesign: not found on PATH"
@@ -156,11 +212,23 @@ def run_osslsigncode(path: Path, tool: str | None) -> tuple[bool, str]:
     return code == 0, "\n".join(sections)
 
 
-def run_exiftool(path: Path, tool: str | None) -> str:
+def run_exiftool(
+    path: Path,
+    tool: str | None,
+    *,
+    force_errors: bool = False,
+) -> str:
     if tool is None:
         return "#### exiftool\n\n```\nexiftool: not found on PATH\n```"
 
     code, output = run_command([tool, str(path)])
+    check_command_result(
+        code,
+        output,
+        context=f"exiftool failed for {path}",
+        allowed_returncodes=frozenset({0}),
+        force_errors=force_errors,
+    )
     sections = [
         "#### exiftool",
         "",
@@ -174,11 +242,24 @@ def run_exiftool(path: Path, tool: str | None) -> str:
     return "\n".join(sections)
 
 
-def run_strings(path: Path, tool: str | None, limit: int) -> str:
+def run_strings(
+    path: Path,
+    tool: str | None,
+    limit: int,
+    *,
+    force_errors: bool = False,
+) -> str:
     if tool is None:
         return "#### strings\n\n```\nstrings: not found on PATH\n```"
 
     code, output = run_command([tool, str(path)])
+    check_command_result(
+        code,
+        output,
+        context=f"strings failed for {path}",
+        allowed_returncodes=frozenset({0}),
+        force_errors=force_errors,
+    )
     lines = [line for line in output.splitlines() if line.strip()]
     limited = lines[:limit]
     rendered = "\n".join(limited) if limited else "(no strings found)"
@@ -203,15 +284,49 @@ def analyze_executable(
     scan_tools: list[str],
     tools: dict[str, str | None],
     strings_limit: int,
+    windows_extensions: set[str],
+    log: KirbyLogger,
+    *,
+    force_errors: bool = False,
 ) -> str:
-    codesign_ok, codesign_section = run_codesign(path, tools["codesign"])
-    osslsigncode_ok, osslsigncode_section = run_osslsigncode(path, tools["osslsigncode"])
+    platform = signature_platform(path, windows_extensions)
+
+    if platform == "windows":
+        log.step(f"Windows PE — running osslsigncode only for {path.name}")
+        codesign_ok = False
+        codesign_section = skipped_signature_section(
+            "codesign",
+            "Skipped for Windows PE (Authenticode verification uses osslsigncode).",
+        )
+        osslsigncode_ok, osslsigncode_section = run_osslsigncode(path, tools["osslsigncode"])
+    elif platform == "macos":
+        log.step(f"macOS binary — running codesign only for {path.name}")
+        codesign_ok, codesign_section = run_codesign(path, tools["codesign"])
+        osslsigncode_ok = False
+        osslsigncode_section = skipped_signature_section(
+            "osslsigncode",
+            "Skipped for macOS binary (code signature verification uses codesign).",
+        )
+    else:
+        log.step(f"Unrecognized executable format — skipping signature tools for {path.name}")
+        codesign_ok = False
+        codesign_section = skipped_signature_section(
+            "codesign",
+            "Skipped (unrecognized executable format).",
+        )
+        osslsigncode_ok = False
+        osslsigncode_section = skipped_signature_section(
+            "osslsigncode",
+            "Skipped (unrecognized executable format).",
+        )
+
     signature_valid = codesign_ok or osslsigncode_ok
 
     lines = [
         f"### `{path}`",
         "",
         f"- **flagged_by:** `{', '.join(scan_tools)}`",
+        f"- **platform:** `{platform}`",
         f"- **signature_valid:** `{'yes' if signature_valid else 'no'}`",
         f"- **codesign:** `{'valid' if codesign_ok else 'invalid or not applicable'}`",
         f"- **osslsigncode:** `{'valid' if osslsigncode_ok else 'invalid or not applicable'}`",
@@ -227,9 +342,9 @@ def analyze_executable(
                 "",
                 "#### Additional analysis (signature check failed)",
                 "",
-                run_exiftool(path, tools["exiftool"]),
+                run_exiftool(path, tools["exiftool"], force_errors=force_errors),
                 "",
-                run_strings(path, tools["strings"], strings_limit),
+                run_strings(path, tools["strings"], strings_limit, force_errors=force_errors),
             ]
         )
 
@@ -283,6 +398,9 @@ def run(
     *,
     verbose: bool = True,
     flagged_csv: Path | None = None,
+    hashes_output: Path | None = None,
+    file_list: Path | None = None,
+    force_errors: bool = False,
 ) -> None:
     log = KirbyLogger(verbose, prefix="signatures")
     log.step(f"Loading config from {config}")
@@ -310,7 +428,15 @@ def run(
     ):
         log.step(f"Analyzing {path}")
         result_sections.append(
-            analyze_executable(path, scan_tools, tools, strings_limit),
+            analyze_executable(
+                path,
+                scan_tools,
+                tools,
+                strings_limit,
+                extensions,
+                log,
+                force_errors=force_errors,
+            ),
         )
 
     log.step(f"Writing report to {output}")

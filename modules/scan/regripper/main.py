@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 from kirby_flagged import fill_flagged_file_hashes, record_flagged
 from kirby_log import KirbyLogger
 from kirby_report import format_scan_report_header
+from kirby_tool_errors import check_subprocess, tool_failure_message, handle_tool_failure
 
 MODULE_DIR = Path(__file__).resolve().parent
 TOOL_NAME = "regripper"
@@ -124,11 +125,32 @@ def config_list(config: configparser.ConfigParser, key: str) -> list[str]:
 
 
 def repo_dir(config: configparser.ConfigParser) -> Path:
-    return MODULE_DIR / config.get("regripper", "repo", fallback="RegRipper3.0")
+    return MODULE_DIR / config.get("regripper", "repo", fallback="RegRipper4.0")
 
 
 def perl5lib_dir(config: configparser.ConfigParser) -> Path:
     return MODULE_DIR / "perl-lib" / "lib" / "perl5"
+
+
+def patch_rip_alert_msg(rip_pl: Path, log: KirbyLogger) -> None:
+    """RegRipper 4.0 rip.pl omits alertMsg() but several plugins still call it."""
+    text = rip_pl.read_text(encoding="utf-8")
+    if "sub alertMsg" in text:
+        return
+
+    marker = "# Kirby patch: restore alertMsg() for TLN/alert plugins"
+    insert = f"""{marker}
+sub alertMsg {{
+\t::rptMsg($_[0]);
+}}
+
+"""
+    anchor = "sub parsePluginsFile"
+    if anchor not in text:
+        raise RuntimeError(f"Could not patch alertMsg into {rip_pl}")
+
+    rip_pl.write_text(text.replace(anchor, insert + anchor, 1), encoding="utf-8")
+    log.step(f"Patched {rip_pl.name} with missing alertMsg() helper")
 
 
 def ensure_regripper(config: configparser.ConfigParser, log: KirbyLogger) -> Path:
@@ -155,6 +177,7 @@ def ensure_regripper(config: configparser.ConfigParser, log: KirbyLogger) -> Pat
     else:
         log.step("RegRipper Perl environment already built")
 
+    patch_rip_alert_msg(rip_pl, log)
     return rip_pl
 
 
@@ -756,6 +779,7 @@ def run(
     verbose: bool = True,
     flagged_csv: Path | None = None,
     file_list: Path | None = None,
+    force_errors: bool = False,
 ) -> None:
     log = KirbyLogger(verbose, prefix="regripper")
     log.step(f"Loading config from {config}")
@@ -792,9 +816,16 @@ def run(
         combined = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
         plugin_runs.append(f"{plugin} → {hive_label} ({hive_path.name})")
 
-        if result.returncode != 0 and not combined:
-            log.step(f"Plugin {plugin} on {hive_label} failed with exit code {result.returncode}")
-            continue
+        failure = tool_failure_message(
+            f"RegRipper plugin {plugin} on {hive_label}",
+            returncode=result.returncode,
+            allowed_returncodes=frozenset({0}),
+            stderr=result.stderr or "",
+        )
+        if failure:
+            handle_tool_failure(failure, force_errors=force_errors)
+            if not combined:
+                continue
 
         analyzer = ANALYZERS.get(category)
         if analyzer:

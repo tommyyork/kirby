@@ -1,21 +1,35 @@
 #!/usr/bin/env bash
-# Build a local Perl environment for RegRipper (Parse::Win32Registry + patched modules).
+# Build a local Perl environment for RegRipper 4.0 (Parse::Win32Registry).
 set -euo pipefail
 
 MODULE_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$MODULE_DIR/RegRipper3.0"
+REPO_DIR="$MODULE_DIR/RegRipper4.0"
 PERL_BASE="$MODULE_DIR/perl-lib"
 PERL5LIB="$PERL_BASE/lib/perl5"
-PATCH_DEST="$PERL5LIB/Parse/Win32Registry/WinNT"
 MARKER="$PERL_BASE/.setup-complete"
 
 if [[ ! -d "$REPO_DIR" ]]; then
   echo "RegRipper repo not found at $REPO_DIR" >&2
-  echo "Clone https://github.com/keydet89/RegRipper3.0 into that directory first." >&2
+  echo "Clone https://github.com/keydet89/RegRipper4.0 into that directory first." >&2
   exit 1
 fi
 
+patch_regripper_rip() {
+  local rip="$REPO_DIR/rip.pl"
+  if grep -q 'sub alertMsg' "$rip"; then
+    return 0
+  fi
+  echo "Patching rip.pl with missing alertMsg() helper ..."
+  perl -i -pe '
+    if (/^sub parsePluginsFile/ && !$done) {
+      $_ = "# Kirby patch: restore alertMsg() for TLN/alert plugins\nsub alertMsg {\n\t::rptMsg(\$_[0]);\n}\n\n" . $_;
+      $done = 1;
+    }
+  ' "$rip"
+}
+
 if [[ -f "$MARKER" ]]; then
+  patch_regripper_rip
   echo "RegRipper Perl environment already built ($PERL_BASE)"
   exit 0
 fi
@@ -31,13 +45,9 @@ echo "Installing Parse::Win32Registry into $PERL_BASE ..."
 PERL_MM_OPT="INSTALL_BASE=$PERL_BASE" PERL5LIB="$PERL5LIB" PERL_MM_USE_DEFAULT=1 \
   cpan Parse::Win32Registry
 
-echo "Applying RegRipper-patched Win32Registry modules ..."
-chmod u+w "$PATCH_DEST/Base.pm" "$PATCH_DEST/File.pm" "$PATCH_DEST/Key.pm" 2>/dev/null || true
-cp "$REPO_DIR/Base.pm" "$PATCH_DEST/Base.pm"
-cp "$REPO_DIR/File.pm" "$PATCH_DEST/File.pm"
-cp "$REPO_DIR/Key.pm" "$PATCH_DEST/Key.pm"
-
 perl -I"$PERL5LIB" -MParse::Win32Registry -e 'print "Parse::Win32Registry OK\n"'
+
+patch_regripper_rip
 
 touch "$MARKER"
 echo "RegRipper Perl environment ready at $PERL_BASE"

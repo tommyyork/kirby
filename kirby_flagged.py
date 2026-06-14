@@ -225,6 +225,7 @@ def prepare_analysis_flagged_csv(
     source_csv: Path,
     scoped_csv: Path,
     include_kext: bool = False,
+    top_n: int | None = None,
 ) -> tuple[Path, int, int]:
     """Return the flagged CSV analysis modules should read.
 
@@ -234,9 +235,19 @@ def prepare_analysis_flagged_csv(
     flagged = load_flagged(source_csv)
     total = len(flagged)
     if target is None:
-        return source_csv, total, total
+        result_csv = source_csv
+        scoped = flagged
+    else:
+        scoped = filter_flagged_for_target(flagged, target, include_kext=include_kext)
+        scoped_csv.parent.mkdir(parents=True, exist_ok=True)
+        save_flagged(scoped, scoped_csv)
+        result_csv = scoped_csv
 
-    filtered = filter_flagged_for_target(flagged, target, include_kext=include_kext)
-    scoped_csv.parent.mkdir(parents=True, exist_ok=True)
-    save_flagged(filtered, scoped_csv)
-    return scoped_csv, len(filtered), total
+    if top_n is not None:
+        limited = dict(list(scoped.items())[:top_n])
+        save_flagged(limited, result_csv)
+        return result_csv, len(limited), total
+
+    if target is None:
+        return result_csv, total, total
+    return result_csv, len(scoped), total

@@ -6,6 +6,7 @@ import os
 import stat
 import subprocess
 from pathlib import Path
+from typing import Literal
 
 
 def is_block_device(path: Path) -> bool:
@@ -66,19 +67,53 @@ def is_regular_file_target(path: Path) -> bool:
         return False
 
 
+def is_file_list_target(path: Path | None) -> bool:
+    """True when -t points at an explicit CSV path list."""
+    if path is None:
+        return False
+    try:
+        return path.is_file() and path.suffix.lower() == ".csv"
+    except OSError:
+        return False
+
+
 def is_scan_target(path: Path) -> bool:
     """True for directory, single-file, or -kext-style scan targets."""
     return path.is_dir() or is_regular_file_target(path)
 
 
 def is_analysis_target(path: Path) -> bool:
-    """True for mount points, disk images, block devices, files, and active mount sources."""
+    """True for mount points, disk images, block devices, files, lists, and mount sources."""
     return (
-        path.is_dir()
+        is_file_list_target(path)
+        or path.is_dir()
         or is_regular_file_target(path)
         or is_disk_image_or_device(path)
         or is_mount_table_source(path)
     )
+
+
+def classify_target_kind(
+    target: Path | None,
+    *,
+    kext_only: bool = False,
+) -> Literal["device", "folder", "file", "list"]:
+    """Classify -t for module target compatibility checks."""
+    if target is None:
+        return "list"
+    if kext_only:
+        return "folder"
+    if is_file_list_target(target):
+        return "list"
+    if is_disk_image_or_device(target):
+        return "device"
+    if is_regular_file_target(target):
+        return "file"
+    if target.is_dir():
+        return "folder"
+    if is_mount_table_source(target):
+        return "device"
+    raise ValueError(f"Unable to classify target kind for {target!r}")
 
 
 def mount_point_for_source(source: Path) -> Path | None:

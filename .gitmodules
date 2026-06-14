@@ -10,9 +10,9 @@
 [submodule "modules/scan/detect-it-easy/Detect-it-easy"]
 	path = modules/scan/detect-it-easy/Detect-it-easy
 	url = https://github.com/horsicq/Detect-It-Easy.git
-[submodule "modules/scan/regripper/RegRipper3.0"]
-	path = modules/scan/regripper/RegRipper3.0
-	url = https://github.com/keydet89/RegRipper3.0.git
 [submodule "modules/analysis/sleuthkit-mactime/SleuthKit"]
 	path = modules/analysis/sleuthkit-mactime/SleuthKit
 	url = https://github.com/sleuthkit/sleuthkit.git
+[submodule "modules/scan/regripper/RegRipper4.0"]
+	path = modules/scan/regripper/RegRipper4.0
+	url = https://github.com/keydet89/RegRipper4.0.git

@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 from kirby_flagged import backfill_flagged_hashes, load_flagged
 from kirby_index import load_hash_cache, lookup_sha256
 from kirby_log import KirbyLogger
+from kirby_tool_errors import check_vt_payload
 
 MODULE_DIR = Path(__file__).resolve().parent
 ENV_PATH = ROOT / ".env"
@@ -448,6 +449,7 @@ def run(
     flagged_csv: Path | None = None,
     hashes_output: Path | None = None,
     file_list: Path | None = None,
+    force_errors: bool = False,
 ) -> None:
     log = KirbyLogger(verbose, prefix="virustotal")
     log.step(f"Loading config from {config}")
@@ -494,6 +496,12 @@ def run(
             last_request_at=last_request_at,
             log=log,
         )
+        if not check_vt_payload(
+            payload,
+            context=f"VirusTotal lookup failed for {digest}",
+            force_errors=force_errors,
+        ):
+            continue
         source = "cache" if from_cache else "API"
         log_query_summary(log, path, digest, payload, source=source)
         result_sections.append(format_result_section(path, digest, scan_tools, payload))

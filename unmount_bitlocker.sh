@@ -1,12 +1,34 @@
 #!/usr/bin/env bash
-# Unmount the BitLocker drive in reverse order.
+# Unmount the NTFS volume mounted by mount_bitlocker.sh (-file or -drive).
 #
 # Usage: sudo ./unmount_bitlocker.sh
 
 set -euo pipefail
 
 DISLOCKER_MOUNT="${DISLOCKER_MOUNT:-/Volumes/dislocker}"
-NTFS_MOUNT="${NTFS_MOUNT:-/Volumes/bitlocker}"
+NTFS_MOUNT_PREFIX="${NTFS_MOUNT_PREFIX:-/Volumes/bitlocker}"
+NTFS_MOUNT="${NTFS_MOUNT:-}"
+
+if [[ -z "${NTFS_MOUNT}" ]]; then
+	if [[ -f /tmp/bitlocker_ntfs_mount ]]; then
+		NTFS_MOUNT=$(cat /tmp/bitlocker_ntfs_mount)
+	else
+		for candidate in \
+			"${NTFS_MOUNT_PREFIX}_file" \
+			"${NTFS_MOUNT_PREFIX}_drive" \
+			/Volumes/bitlocker; do
+			if mount | grep -q " on ${candidate} "; then
+				NTFS_MOUNT="${candidate}"
+				break
+			fi
+		done
+	fi
+fi
+
+if [[ -z "${NTFS_MOUNT}" ]]; then
+	echo "No BitLocker NTFS mount found. Set NTFS_MOUNT or run mount_bitlocker.sh first." >&2
+	exit 1
+fi
 
 if [[ "${EUID}" -ne 0 ]]; then
 	echo "Run as root: sudo $0" >&2
@@ -42,5 +64,5 @@ if [[ -f /tmp/bitlocker_dislocker_pid ]]; then
 	rm -f /tmp/bitlocker_dislocker_pid
 fi
 
-rm -f /tmp/bitlocker_raw_disk
+rm -f /tmp/bitlocker_raw_disk /tmp/bitlocker_ntfs_mount
 echo "Done."

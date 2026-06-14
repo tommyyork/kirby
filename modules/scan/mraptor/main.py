@@ -12,9 +12,11 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from kirby_file_list import read_scan_paths, uses_explicit_file_list
 from kirby_flagged import record_flagged
 from kirby_log import KirbyLogger
 from kirby_report import format_scan_report_header
+from kirby_tool_errors import check_subprocess
 
 MODULE_DIR = Path(__file__).resolve().parent
 TOOL_NAME = "mraptor"
@@ -106,17 +108,7 @@ def has_valid_office_header(path: Path) -> bool:
 
 
 def read_file_list(path: Path, log: KirbyLogger) -> list[Path]:
-    if not path.is_file():
-        raise FileNotFoundError(f"File list not found: {path}")
-
-    log.step(f"Reading file inventory from {path}")
-    files: list[Path] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        entry = line.strip()
-        if entry:
-            files.append(Path(entry))
-    log.step(f"Loaded {len(files)} paths from inventory")
-    return files
+    return read_scan_paths(path, log)
 
 
 def filter_eligible_files(
@@ -242,6 +234,7 @@ def run(
     verbose: bool = True,
     flagged_csv: Path | None = None,
     file_list: Path | None = None,
+    force_errors: bool = False,
 ) -> None:
     log = KirbyLogger(verbose, prefix="mraptor")
     log.step(f"Loading config from {config}")
@@ -251,7 +244,10 @@ def run(
     extensions = eligible_extensions(settings)
     show_matches = config_bool(settings, "show_matches", default=True)
 
-    all_files = read_file_list(file_list_path, log)
+    if uses_explicit_file_list(target, file_list_path):
+        all_files = read_file_list(target, log)
+    else:
+        all_files = read_file_list(file_list_path, log)
     eligible_files = filter_eligible_files(all_files, extensions, settings, log)
     mraptor_cmd = find_mraptor(log)
 
@@ -264,6 +260,13 @@ def run(
         unit="file",
     ):
         result = run_mraptor(mraptor_cmd, filepath, show_matches=show_matches)
+        if not check_subprocess(
+            result,
+            context=f"mraptor failed for {filepath}",
+            allowed_returncodes=frozenset({0, MRAPTOR_SUSPICIOUS_EXIT}),
+            force_errors=force_errors,
+        ):
+            continue
         if is_mraptor_suspicious(result):
             summary = (result.stdout or "").strip().splitlines()
             detail = summary[0] if summary else "suspicious macro behavior"

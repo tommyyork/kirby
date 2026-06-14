@@ -18,6 +18,7 @@ from kirby_flagged import record_flagged
 from kirby_index import mount_entry, resolve_mount_point, scan_root_relative
 from kirby_log import KirbyLogger
 from kirby_report import format_scan_report_header, scan_timestamp
+from kirby_tool_errors import check_subprocess
 
 MODULE_DIR = Path(__file__).resolve().parent
 MODULE_SECTION = "simple-rescue"
@@ -417,6 +418,8 @@ def scan_candidates_with_mraptor(
     mraptor_config: Path,
     settings: configparser.ConfigParser,
     log: KirbyLogger,
+    *,
+    force_errors: bool = False,
 ) -> tuple[list[RescueCandidate], list[ExcludedFile]]:
     mraptor = load_mraptor_module()
     show_matches = config_bool(settings, "mraptor_show_matches", default=True)
@@ -436,6 +439,13 @@ def scan_candidates_with_mraptor(
         unit="file",
     ):
         result = mraptor.run_mraptor(command, candidate.path, show_matches=show_matches)
+        if not check_subprocess(
+            result,
+            context=f"mraptor failed for {candidate.path}",
+            allowed_returncodes=frozenset({0, mraptor.MRAPTOR_SUSPICIOUS_EXIT}),
+            force_errors=force_errors,
+        ):
+            continue
         if mraptor.is_mraptor_suspicious(result):
             summary = (result.stdout or "").strip().splitlines()
             detail = summary[0] if summary else "suspicious macro behavior"
@@ -693,9 +703,17 @@ def run_windows_rescue(
     file_list_path: Path,
     flagged_csv: Path | None,
     log: KirbyLogger,
+    *,
+    force_errors: bool = False,
 ) -> None:
     usernames = discover_windows_users(volume_root, target, config, log)
     files = read_file_list(file_list_path, log)
+    if not files:
+        log.step(
+            f"No paths in {file_list_path}; rescue cannot select files. "
+            "Re-run Kirby against the mount point or user profile so tmp/<name>/all_files "
+            "is populated (check for volume cache mismatches in startup diagnostics)."
+        )
     candidates = collect_rescue_candidates(
         files,
         volume_root,
@@ -715,6 +733,7 @@ def run_windows_rescue(
         mraptor_config,
         config,
         log,
+        force_errors=force_errors,
     )
 
     mraptor_eligible, _ = mraptor_eligible_candidates(
@@ -735,6 +754,7 @@ def run_windows_rescue(
         log.step(f"Updated {updated} excluded path(s) in {flagged_csv}")
 
     rescue_root = rescue_output_root(output)
+    rescue_root.mkdir(parents=True, exist_ok=True)
     copied = copy_rescue_files(safe_candidates, rescue_root, log)
 
     result = RescueResult(
@@ -781,6 +801,7 @@ def run(
     verbose: bool = True,
     flagged_csv: Path | None = None,
     file_list: Path | None = None,
+    force_errors: bool = False,
 ) -> None:
     log = KirbyLogger(verbose, prefix="simple-rescue")
     log.step(f"Loading config from {config}")
@@ -805,6 +826,7 @@ def run(
             file_list_path,
             flagged_csv_path,
             log,
+            force_errors=force_errors,
         )
         return
 

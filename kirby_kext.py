@@ -88,12 +88,21 @@ def kext_fingerprint() -> dict[str, object]:
     }
 
 
-def write_kext_file_list(destination: Path, hashes_destination: Path, log: KirbyLogger) -> int:
+def write_kext_file_list(
+    destination: Path,
+    hashes_destination: Path,
+    log: KirbyLogger,
+    *,
+    max_files: int | None = None,
+) -> int:
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     log.step("Enumerating kernel extension bundles")
     bundles = list(iter_kext_bundles())
     log.step(f"Found {len(bundles)} kext bundle(s)")
+
+    if max_files is not None:
+        log.step(f"Indexing kext files (stopping after {max_files} file(s))")
 
     entries: list[tuple[str, str]] = []
     for path in log.progress(iter_kext_files(), desc="Indexing kext files", unit="file"):
@@ -104,10 +113,14 @@ def write_kext_file_list(destination: Path, hashes_destination: Path, log: Kirby
         except OSError as exc:
             log.step(f"Could not hash {path}: {exc}")
         entries.append((path_str, digest))
+        if max_files is not None and len(entries) >= max_files:
+            log.step(f"Stopped indexing at {max_files} kext path(s) (-top {max_files})")
+            break
 
-    entries.sort(key=lambda item: item[0])
+    if max_files is None:
+        entries.sort(key=lambda item: item[0])
     paths = [path for path, _ in entries]
-    destination.write_text("\n".join(paths) + ("\n" if paths else ""), encoding="utf-8")
+    write_path_list(destination, paths)
     write_hash_cache(entries, hashes_destination)
     log.step(f"Wrote {len(entries)} SHA-256 hash(es) to {hashes_destination}")
     return len(entries)
@@ -195,9 +208,22 @@ def ensure_kext_file_list(
     tmp_meta_path: Path,
     tmp_hashes_path: Path,
     log: KirbyLogger | None = None,
+    *,
+    top_n: int | None = None,
 ) -> int:
     if log is None:
         log = KirbyLogger(True)
+
+    if top_n is not None:
+        log.step(f"Building limited kernel extension inventory (-top {top_n})")
+        count = write_kext_file_list(
+            tmp_files_path,
+            tmp_hashes_path,
+            log,
+            max_files=top_n,
+        )
+        save_file_list_meta(tmp_meta_path, kext_fingerprint(), count)
+        return count
 
     kext_files, kext_hashes, file_count = ensure_kext_cache(log)
     publish_kext_inventory(

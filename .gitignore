@@ -12,8 +12,21 @@ __pycache__/
 
 # Runtime / generated data
 tmp/
-cache/
+/cache/
 output/
+
+# Kirby test artifacts
+test/mount/
+test/mounts/
+test/output/
+test/tmp/
+
+# NTFS test assets (Windows DLLs/drivers/docs from populate_ntfs_test_tree.sh;
+# raw image from create_ntfs_test_image.sh — do not commit)
+test/assets/ntfs_test/
+test/assets/ntfs_test.dd
+test/assets/.ntfs_test_mount/
+test/assets/.verify_mount/
 
 # Logs
 *.log

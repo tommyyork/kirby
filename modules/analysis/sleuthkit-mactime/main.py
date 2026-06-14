@@ -578,6 +578,7 @@ def run(
     config: Path,
     *,
     verbose: bool = True,
+    force_errors: bool = False,
 ) -> None:
     log = KirbyLogger(verbose, prefix="sleuthkit-mactime")
     log.step(f"Loading config from {config}")

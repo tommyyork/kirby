@@ -10,11 +10,37 @@ from pathlib import Path
 from typing import Literal
 
 from kirby_flagged import backfill_flagged_hashes, normalize_flagged_csv, prepare_analysis_flagged_csv
-from kirby_index import ensure_file_list, ensure_single_file_list, count_indexed_paths
+from kirby_index import (
+    clear_volume_cache,
+    count_indexed_paths,
+    ensure_file_list,
+    ensure_single_file_list,
+    find_cached_paths,
+    limit_inventory,
+)
 from kirby_kext import KEXT_TARGET, append_kext_to_inventory, ensure_kext_file_list, is_kext_target
+from kirby_file_list import (
+    WorkingList,
+    is_file_list_target,
+    materialize_plain_list_for_analysis,
+    resolve_working_list,
+)
 from kirby_log import KirbyLogger
+from kirby_module_targets import (
+    ModuleKind as TargetModuleKind,
+    TargetKind,
+    build_target_compatibility_report,
+    format_target_compatibility_report,
+    load_module_targets,
+)
 from kirby_paths import DEFAULT_NAMESPACE, target_paths
-from kirby_target import is_analysis_target, is_disk_image_or_device, is_mount_table_source, is_regular_file_target
+from kirby_target import (
+    classify_target_kind,
+    is_analysis_target,
+    is_disk_image_or_device,
+    is_mount_table_source,
+    is_regular_file_target,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -25,9 +51,15 @@ RESCUE_MODULES_DIR = MODULES_DIR / "rescue"
 DEFAULT_OUTPUT_DIR = ROOT / "output"
 ModuleKind = Literal["scan", "analysis", "rescue"]
 
+EXIT_SUCCESS = 0
+EXIT_MODULE_FAILURE = 1
+EXIT_TARGET_MISMATCH = 2
+
 MODULE_ALIASES: dict[str, str] = {
     "die": "detect-it-easy",
 }
+
+INVENTORY_OPTIONAL_SCAN = frozenset({"sleuthkit-ntfs"})
 
 
 def normalize_module_name(name: str) -> str:
@@ -105,6 +137,16 @@ def validate_target_name(name: str) -> str:
     return cleaned
 
 
+def parse_top_n(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"-top must be a positive integer, not {value!r}") from exc
+    if count < 1:
+        raise argparse.ArgumentTypeError("-top must be a positive integer")
+    return count
+
+
 def run_module(
     name: str,
     kind: ModuleKind,
@@ -116,6 +158,7 @@ def run_module(
     file_list: Path | None = None,
     hashes_output: Path | None = None,
     include_kext: bool = False,
+    force_errors: bool = False,
 ) -> Path:
     log = KirbyLogger(verbose, prefix=normalize_module_name(name))
     module_dir = resolve_module_dir(name, kind)
@@ -141,10 +184,35 @@ def run_module(
         kwargs["hashes_output"] = hashes_output
     if include_kext:
         kwargs["include_kext"] = include_kext
+    kwargs["force_errors"] = force_errors
 
     run(**kwargs)
 
     return output_path
+
+
+def collect_requested_modules(
+    scan_modules: list[str],
+    analysis_modules: list[str],
+    rescue_modules: list[str],
+) -> list[tuple[str, TargetModuleKind]]:
+    requested: list[tuple[str, TargetModuleKind]] = []
+    for name in scan_modules:
+        requested.append((normalize_module_name(name), "scan"))
+    for name in rescue_modules:
+        requested.append((normalize_module_name(name), "rescue"))
+    for name in analysis_modules:
+        requested.append((normalize_module_name(name), "analysis"))
+    return requested
+
+
+def load_module_supported_targets(
+    module_name: str,
+    kind: TargetModuleKind,
+) -> frozenset[TargetKind]:
+    module_dir = resolve_module_dir(module_name, kind)
+    config_path = resolve_config_path(module_dir)
+    return load_module_targets(config_path)
 
 
 def log_arguments(args: argparse.Namespace, log: KirbyLogger) -> None:
@@ -158,8 +226,8 @@ def analysis_modules_without_target() -> frozenset[str]:
 
 
 def analysis_modules_require_target(analysis_modules: list[str]) -> bool:
-    optional = analysis_modules_without_target()
-    return any(normalize_module_name(name) not in optional for name in analysis_modules)
+    del analysis_modules
+    return False
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -172,11 +240,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=False,
         type=Path,
         help=(
-            "Scan target: mount point directory, specific file path, disk image file, or "
+            "Scan target: mount point directory, specific file path, CSV file list, disk image file, or "
             "block device (e.g. /Volumes/bitlocker, /Volumes/Windows/Users/jane/file.exe, "
-            "/dev/disk4). Optional with -kext to also scan local kernel extensions. "
-            "Optional for -a virustotal or -a signatures when using tmp/<name>/flagged.csv; "
-            "when provided, analysis modules only process flagged paths under the target."
+            "tmp/<name>/paths.csv, /dev/disk4). Optional with -kext to also scan local kernel extensions. "
+            "Optional for -a when tmp/<name>/flagged.csv or -t <paths.csv> is populated; "
+            "when a directory or file target is provided, analysis modules scope flagged paths under it."
         ),
     )
     parser.add_argument(
@@ -223,12 +291,71 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Base output directory for markdown reports (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
+        "-top",
+        type=parse_top_n,
+        metavar="N",
+        help=(
+            "Process only the first N files: stop indexing after N paths, then scan, "
+            "analyze, and rescue within that limited set (useful for smoke tests)"
+        ),
+    )
+    parser.add_argument(
         "-s",
         "--silent",
         action="store_true",
         help="Suppress detailed progress output and module progress bars",
     )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help=(
+            "Delete the persistent volume inventory cache for the -t target before indexing "
+            "(requires -t/--target)"
+        ),
+    )
+    parser.add_argument(
+        "-find",
+        metavar="REGEX",
+        help=(
+            "Search cached file inventories for paths matching REGEX. Simple * and ? "
+            "wildcards are supported. Use with -n and/or -t; without -t, -n searches all "
+            "volume caches plus tmp/<name>/all_files."
+        ),
+    )
+    parser.add_argument(
+        "--force-errors",
+        action="store_true",
+        help=(
+            "Continue when a module hits serious external-tool errors (non-zero exit codes, "
+            "fatal stderr, API failures). By default Kirby stops the run and exits with an error."
+        ),
+    )
     return parser
+
+
+def scan_allows_device_target(scan_modules: list[str]) -> bool:
+    return any(normalize_module_name(name) in INVENTORY_OPTIONAL_SCAN for name in scan_modules)
+
+
+def needs_file_inventory(
+    target: Path | None,
+    scan_modules: list[str],
+    rescue_modules: list[str],
+) -> bool:
+    if target is not None and is_file_list_target(target):
+        return False
+    if rescue_modules:
+        return True
+    if not scan_modules:
+        return False
+    optional_only = all(
+        normalize_module_name(name) in INVENTORY_OPTIONAL_SCAN for name in scan_modules
+    )
+    if optional_only:
+        return False
+    if target is not None and is_disk_image_or_device(target):
+        return True
+    return True
 
 
 def validate_target(
@@ -237,15 +364,20 @@ def validate_target(
     scan_modules: list[str],
     rescue_modules: list[str],
 ) -> None:
+    if is_file_list_target(path):
+        return
+
     if is_regular_file_target(path):
         return
 
     if scan_modules or rescue_modules:
-        if not path.is_dir():
-            raise argparse.ArgumentTypeError(
-                f"Scan target must be a directory or regular file: {path}"
-            )
-        return
+        if path.is_dir():
+            return
+        if scan_allows_device_target(scan_modules) and is_disk_image_or_device(path):
+            return
+        raise argparse.ArgumentTypeError(
+            f"Scan target must be a directory, regular file, or block device/image: {path}"
+        )
 
     if is_analysis_target(path):
         return
@@ -261,10 +393,10 @@ def main(argv: list[str] | None = None) -> int:
     verbose = not args.silent
     log = KirbyLogger(verbose)
 
-    if not args.engines and not args.analysis and not args.rescue:
+    if not args.engines and not args.analysis and not args.rescue and not args.find:
         parser.error(
-            "At least one of -e (scan modules), -a (analysis modules), or "
-            "-r (rescue modules) is required"
+            "At least one of -e (scan modules), -a (analysis modules), "
+            "-r (rescue modules), or -find is required"
         )
 
     scan_modules = args.engines or []
@@ -286,15 +418,14 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(
                 "-t/--target or -kext is required when running scan or rescue modules"
             )
-        if analysis_modules_require_target(analysis_modules):
-            parser.error("-t/--target is required for the selected analysis module(s)")
-        print(
-            f"[kirby] No target argument was provided; analyzing "
-            f"tmp/{DEFAULT_NAMESPACE}/flagged.csv (use -n to select another namespace)."
-        )
+        if not args.find and not analysis_modules:
+            print(
+                f"[kirby] No target argument was provided; analyzing "
+                f"tmp/{DEFAULT_NAMESPACE}/flagged.csv (use -n to select another namespace)."
+            )
     elif kext_only and rescue_modules:
         parser.error("Rescue modules require -t/--target (-kext alone is not supported)")
-    elif not is_kext_target(target):
+    elif not is_kext_target(target) and not args.find:
         try:
             validate_target(
                 target,
@@ -304,9 +435,53 @@ def main(argv: list[str] | None = None) -> int:
         except argparse.ArgumentTypeError as exc:
             parser.error(str(exc))
 
+    if args.clear_cache:
+        if target is None or is_kext_target(target):
+            parser.error("--clear-cache requires -t/--target pointing at a mounted volume or file")
+        clear_volume_cache(target, log)
+
+    if args.find:
+        if target is None and args.name is None:
+            parser.error("-find requires -n/--name and/or -t/--target")
+
     target_name = args.name if args.name is not None else DEFAULT_NAMESPACE
     paths = target_paths(target_name)
+
+    if args.find:
+        tmp_files = paths.all_files if paths.all_files.is_file() else None
+        matches = find_cached_paths(
+            args.find,
+            target=target,
+            tmp_files_path=tmp_files,
+            search_all_caches=target is None,
+            log=log,
+        )
+        for match in matches:
+            print(match)
+        if not log.verbose:
+            print(f"[kirby] {len(matches)} match(es) for pattern {args.find!r}", file=sys.stderr)
+        else:
+            log.step(f"Found {len(matches)} match(es) for pattern {args.find!r}")
+        return 0
+
     paths.ensure_tmp_dir()
+    working_list = resolve_working_list(target, paths.flagged_csv)
+
+    try:
+        target_kind = classify_target_kind(target, kext_only=kext_only)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    target_compatibility = build_target_compatibility_report(
+        collect_requested_modules(scan_modules, analysis_modules, rescue_modules),
+        target_kind=target_kind,
+        working_list_available=working_list is not None,
+        load_supported=load_module_supported_targets,
+    )
+    if target_compatibility.has_failures():
+        print(format_target_compatibility_report(target_compatibility), file=sys.stderr)
+        return EXIT_TARGET_MISMATCH
+
     normalized_flagged = normalize_flagged_csv(paths.flagged_csv)
     if normalized_flagged:
         log.step(f"Normalized tool names for {normalized_flagged} path(s) in {paths.flagged_csv}")
@@ -320,12 +495,24 @@ def main(argv: list[str] | None = None) -> int:
         log.step("Resolved target: macOS kernel extensions (-kext)")
     elif include_kext and target is not None:
         log.step(f"Resolved target: {target} plus macOS kernel extensions (-kext)")
+    elif target is not None and is_file_list_target(target):
+        log.step(f"Resolved target: CSV file list {target}")
+        if working_list is not None:
+            log.step(
+                f"File list ready ({working_list.entry_count} path(s) from {working_list.source})"
+            )
     elif target is not None and is_regular_file_target(target):
         log.step(f"Resolved target: single file {target}")
     elif target is not None:
         log.step(f"Resolved target: {target}")
     else:
-        log.step(f"No target provided; using flagged file list at {paths.flagged_csv}")
+        if working_list is not None:
+            log.step(
+                f"No filesystem target provided; using {working_list.path} "
+                f"({working_list.entry_count} path(s))"
+            )
+        else:
+            log.step(f"No target provided; using flagged file list at {paths.flagged_csv}")
     log.step(f"Target name: {target_name}")
     log.step(f"Working directory: {paths.tmp_dir}")
     log.step(f"Output directory: {output_dir}")
@@ -335,39 +522,63 @@ def main(argv: list[str] | None = None) -> int:
         log.step(f"Analysis modules: {', '.join(analysis_modules)}")
     if rescue_modules:
         log.step(f"Rescue modules: {', '.join(rescue_modules)}")
+    if args.top is not None:
+        log.step(f"Limiting run to first {args.top} file(s) (-top {args.top})")
+
+    top_n = args.top
+    scan_file_list = (
+        target
+        if target is not None and is_file_list_target(target)
+        else paths.all_files
+    )
 
     if scan_modules or rescue_modules:
-        if is_kext_target(target):
-            file_count = ensure_kext_file_list(
-                paths.all_files,
-                paths.all_files_meta,
-                paths.sha256_hashes,
-                log,
-            )
-        elif is_regular_file_target(target):
-            file_count = ensure_single_file_list(
-                target,
-                paths.all_files,
-                paths.all_files_meta,
-                paths.sha256_hashes,
-                log,
-            )
+        if needs_file_inventory(target, scan_modules, rescue_modules):
+            if is_kext_target(target):
+                file_count = ensure_kext_file_list(
+                    paths.all_files,
+                    paths.all_files_meta,
+                    paths.sha256_hashes,
+                    log,
+                    top_n=top_n,
+                )
+            elif is_regular_file_target(target):
+                file_count = ensure_single_file_list(
+                    target,
+                    paths.all_files,
+                    paths.all_files_meta,
+                    paths.sha256_hashes,
+                    log,
+                )
+            else:
+                hash_files = bool(scan_modules) or bool(analysis_modules)
+                file_count = ensure_file_list(
+                    target,
+                    paths.all_files,
+                    paths.all_files_meta,
+                    paths.sha256_hashes,
+                    log,
+                    hash_files=hash_files,
+                    top_n=top_n,
+                )
+            if include_kext and not is_kext_target(target):
+                append_kext_to_inventory(
+                    paths.all_files,
+                    paths.sha256_hashes,
+                    log,
+                )
+                if top_n is not None:
+                    limit_inventory(
+                        paths.all_files,
+                        paths.sha256_hashes,
+                        paths.all_files_meta,
+                        top_n,
+                        log,
+                    )
+            file_count = count_indexed_paths(paths.all_files)
+            log.step(f"File inventory ready ({file_count} paths)")
         else:
-            file_count = ensure_file_list(
-                target,
-                paths.all_files,
-                paths.all_files_meta,
-                paths.sha256_hashes,
-                log,
-            )
-        if include_kext and not is_kext_target(target):
-            append_kext_to_inventory(
-                paths.all_files,
-                paths.sha256_hashes,
-                log,
-            )
-        file_count = count_indexed_paths(paths.all_files)
-        log.step(f"File inventory ready ({file_count} paths)")
+            log.step("Skipping file inventory (not required for selected scan module(s))")
 
     for module in scan_modules:
         log.step(f"Running scan module: {module}")
@@ -379,12 +590,17 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir,
                 verbose,
                 flagged_csv=paths.flagged_csv,
-                file_list=paths.all_files,
+                file_list=(
+                    scan_file_list
+                    if is_file_list_target(target) or scan_file_list.is_file()
+                    else None
+                ),
                 include_kext=include_kext and not is_kext_target(target),
+                force_errors=args.force_errors,
             )
         except (FileNotFoundError, ImportError, AttributeError, TypeError, RuntimeError) as exc:
             print(f"Error running scan module {module}: {exc}", file=sys.stderr)
-            return 1
+            return EXIT_MODULE_FAILURE
 
         print(f"[{module}] wrote {output_path}")
         log.step(f"Finished scan module: {module}")
@@ -400,15 +616,24 @@ def main(argv: list[str] | None = None) -> int:
                 verbose,
                 flagged_csv=paths.flagged_csv,
                 file_list=paths.all_files,
+                force_errors=args.force_errors,
             )
         except (FileNotFoundError, ImportError, AttributeError, TypeError, RuntimeError) as exc:
             print(f"Error running rescue module {module}: {exc}", file=sys.stderr)
-            return 1
+            return EXIT_MODULE_FAILURE
 
         print(f"[{module}] wrote {output_path}")
         log.step(f"Finished rescue module: {module}")
 
     if analysis_modules:
+        if working_list is None:
+            print(
+                "Error: analysis modules require a populated file list "
+                f"(pass -t <paths.csv> or ensure {paths.flagged_csv} has entries)",
+                file=sys.stderr,
+            )
+            return EXIT_TARGET_MISMATCH
+
         backfilled = backfill_flagged_hashes(
             paths.flagged_csv,
             hashes_path=paths.sha256_hashes,
@@ -416,21 +641,38 @@ def main(argv: list[str] | None = None) -> int:
         if backfilled:
             log.step(f"Backfilled {backfilled} SHA-256 hash(es) in {paths.flagged_csv}")
 
-        analysis_flagged_csv, scoped_count, total_count = prepare_analysis_flagged_csv(
-            target,
-            source_csv=paths.flagged_csv,
-            scoped_csv=paths.flagged_scoped_csv,
-            include_kext=include_kext and not is_kext_target(target),
-        )
-        if target is None:
+        if working_list.source == "file_list":
+            if working_list.kind == "flagged":
+                analysis_flagged_csv = working_list.path
+                scoped_count = working_list.entry_count
+                total_count = scoped_count
+            else:
+                analysis_flagged_csv = materialize_plain_list_for_analysis(
+                    working_list.path,
+                    paths.flagged_scoped_csv,
+                )
+                scoped_count = working_list.entry_count
+                total_count = scoped_count
             log.step(
-                f"Analysis flagged scope: all {total_count} path(s) from {paths.flagged_csv}"
+                f"Analysis file list: {scoped_count} path(s) from {working_list.path}"
             )
         else:
-            log.step(
-                f"Analysis flagged scope: {scoped_count} of {total_count} path(s) under {target}"
+            analysis_flagged_csv, scoped_count, total_count = prepare_analysis_flagged_csv(
+                target,
+                source_csv=paths.flagged_csv,
+                scoped_csv=paths.flagged_scoped_csv,
+                include_kext=include_kext and not is_kext_target(target),
+                top_n=top_n,
             )
-            log.step(f"Using scoped flagged list at {analysis_flagged_csv}")
+            if target is None:
+                log.step(
+                    f"Analysis flagged scope: all {total_count} path(s) from {paths.flagged_csv}"
+                )
+            else:
+                log.step(
+                    f"Analysis flagged scope: {scoped_count} of {total_count} path(s) under {target}"
+                )
+                log.step(f"Using scoped flagged list at {analysis_flagged_csv}")
 
     for module in analysis_modules:
         log.step(f"Running analysis module: {module}")
@@ -443,16 +685,17 @@ def main(argv: list[str] | None = None) -> int:
                 verbose,
                 flagged_csv=analysis_flagged_csv,
                 hashes_output=paths.virustotal_hashes,
+                force_errors=args.force_errors,
             )
         except (FileNotFoundError, ImportError, AttributeError, TypeError, RuntimeError) as exc:
             print(f"Error running analysis module {module}: {exc}", file=sys.stderr)
-            return 1
+            return EXIT_MODULE_FAILURE
 
         print(f"[{module}] wrote {output_path}")
         log.step(f"Finished analysis module: {module}")
 
     log.step("All modules completed")
-    return 0
+    return EXIT_SUCCESS
 
 
 if __name__ == "__main__":

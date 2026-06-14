@@ -2,11 +2,25 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-TMP_ROOT = ROOT / "tmp"
+
+
+def resolve_tmp_root() -> Path:
+    """Return the Kirby tmp root (override with KIRBY_TMP_ROOT for tests)."""
+    override = os.environ.get("KIRBY_TMP_ROOT", "").strip()
+    if override:
+        path = Path(override)
+        if not path.is_absolute():
+            path = ROOT / path
+        return path
+    return ROOT / "tmp"
+
+
+TMP_ROOT = resolve_tmp_root()
 DEFAULT_OUTPUT_DIR = ROOT / "output"
 DEFAULT_NAMESPACE = "default_namespace"
 
@@ -42,6 +56,10 @@ class TargetPaths:
     @property
     def virustotal_hashes(self) -> Path:
         return self.tmp_dir / "virustotal-hashes"
+
+    @property
+    def file_list_csv(self) -> Path:
+        return self.tmp_dir / "file-list.csv"
 
     def output_dir(self, base: Path = DEFAULT_OUTPUT_DIR) -> Path:
         return base / self.name

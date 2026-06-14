@@ -18,9 +18,8 @@ The intended workflow is:
 
 ```bash
 # One-time setup
-python3 -m venv .venv
+./setup-venv.sh
 source .venv/bin/activate
-pip install -r requirements.txt
 
 # Mount the BitLocker volume (see mount_bitlocker.sh)
 export BITLOCKER_RECOVERY_PASSWORD='...'
@@ -37,7 +36,7 @@ External tools required depend on which modules you enable — see [Prerequisite
 ## Kirby CLI
 
 ```
-usage: kirby.py [-h] [-t TARGET] [-kext] [-e ENGINES] [-a ANALYSIS] [-r RESCUE] [-n NAME] [-o OUTPUT] [-s]
+usage: kirby.py [-h] [-t TARGET] [-kext] [-e ENGINES] [-a ANALYSIS] [-r RESCUE] [-n NAME] [-o OUTPUT] [-top N] [-s] [--clear-cache] [--force-errors] [-find REGEX]
 ```
 
 
@@ -50,7 +49,11 @@ usage: kirby.py [-h] [-t TARGET] [-kext] [-e ENGINES] [-a ANALYSIS] [-r RESCUE] 
 | `-r`    | `--rescue`   | No*      | —                   | Comma-separated **rescue** module names (e.g. `simple-rescue`)                                                                              |
 | `-n`    | `--name`     | No       | `default_namespace` | Namespace for this run; working files go in `tmp/<name>/`, reports in `output/<name>/`                                                      |
 | `-o`    | `--output`   | No       | `output/`           | Base output directory; reports go in `<output>/<name>/`                                                                                     |
+| `-top`  | —            | No       | —                   | Process only the first **N** files: stop indexing after N paths, then scan, analyze, and rescue within that set (smoke tests)                 |
 | `-s`    | `--silent`   | No       | off                 | Suppress detailed progress logs and tqdm progress bars                                                                                      |
+| —       | `--clear-cache` | No    | off                 | Delete the persistent volume file inventory cache for `-t` before indexing (see [Volume inventory cache](#volume-inventory-cache))             |
+| —       | `--force-errors` | No | off                 | Continue when a module hits serious external-tool errors (see [Error handling](#error-handling))                                               |
+| `-find` | —            | No       | —                   | Search cached file inventories for paths matching REGEX (`*` and `?` wildcards supported); use with `-n` and/or `-t`                           |
 
 
 At least one of `-e`, `-a`, or `-r` must be provided. When running scan or rescue modules, provide `-t`, `-kext`, or both.
@@ -58,6 +61,40 @@ At least one of `-e`, `-a`, or `-r` must be provided. When running scan or rescu
 Module names are case-insensitive. Scan modules run first, then rescue modules, then analysis modules.
 
 Verbose output (step-by-step logs and progress bars) is the **default**. Pass `-s` for minimal output.
+
+### Error handling
+
+By default, Kirby **stops the run** and exits with a non-zero status when any module hits a serious external-tool failure — for example a non-zero exit code from `yara`, `diec`, `olevba`, or `mraptor`; fatal `error:` lines on stderr; RegRipper plugin failures; or VirusTotal API errors other than “hash not found” (HTTP 404).
+
+When that happens, Kirby prints the failing module name and error message, and later modules in the same invocation are not run.
+
+Pass `--force-errors` to keep going: the failing module logs a warning, skips the affected file or batch, and Kirby continues with the rest of the pipeline. Use this for partial results when you accept incomplete coverage (for example during debugging or when a few paths are unreadable).
+
+```bash
+# Default: stop on first serious tool error
+python kirby.py -t /Volumes/Windows -n laptop_ssd -e yara,oletools
+
+# Best-effort run: warn and continue past tool failures
+python kirby.py -t /Volumes/Windows -n laptop_ssd -e yara,oletools --force-errors
+```
+
+### Limiting runs (`-top`)
+
+Pass `-top N` to exercise the full pipeline on only the first **N** files. Kirby stops the directory walk after N paths are indexed, publishes those paths to `tmp/<name>/all_files`, and scan, rescue, and analysis modules operate only on that limited set.
+
+When a volume cache already exists, Kirby takes the first N matching paths from the cached inventory instead of re-walking the volume. Limited runs write only to `tmp/<name>/` — they do not overwrite the shared volume cache under `cache/volumes/`.
+
+For **analysis-only** runs, `-top N` keeps the first N rows from the scoped `flagged.csv` (after `-t` filtering).
+
+```bash
+# Smoke-test YARA on the first 10 files under a mount
+python kirby.py -t /Volumes/bitlocker -n bitlocker -e yara -top 10
+
+# Quick end-to-end check: scan, analyze, and rescue 5 files
+python kirby.py -t /Volumes/Windows/Users/riley -n laptop_ssd -e yara -a virustotal -r simple-rescue -top 5
+```
+
+During a fresh index, paths are collected in directory-walk order (not sorted). When truncating an existing cached inventory, paths keep the order stored in `all_files`.
 
 ### Target naming (`-n`)
 
@@ -67,7 +104,7 @@ The same namespace can be reused across multiple mount points or devices. Each s
 
 ### Single-file targets
 
-Pass a **file path** to `-t` to run scan modules against that one file only. Kirby writes the path to `tmp/<name>/all_files` and passes it to inventory-driven engines (`detect-it-easy`, `oletools`, `mraptor`, etc.). YARA scans the file directly (without recursion). Registry-oriented modules such as RegRipper still expect a directory or volume mount and are not useful with a single-file target.
+Pass a **file path** to `-t` to run scan modules against that one file only. Kirby writes the path to `tmp/<name>/all_files` and passes it to inventory-driven engines (`detect-it-easy`, `oletools`, `mraptor`, etc.). YARA scans the file directly (without recursion). `sleuthkit-ntfs` analyzes the file's MFT entry via Sleuth Kit and does not require a file inventory. Registry-oriented modules such as RegRipper still expect a directory or volume mount and are not useful with a single-file target.
 
 ```bash
 # Scan one executable with Detect It Easy
@@ -133,7 +170,26 @@ When scan or rescue modules run, Kirby first builds or reuses a file inventory, 
 - `**tmp/<name>/all_files.meta**` — fingerprint used to skip re-indexing when the target has not changed
 - `**tmp/<name>/sha256_hashes**` — tab-separated path and SHA-256 digest for indexed files
 
-**Directory targets** use a **volume-level** cache under `cache/volumes/<mount>/_root/`. Kirby walks the mount point once, then filters paths when `-t` is a subdirectory. Scanning `/Volumes/Windows/Users` after `/Volumes/Windows` reuses the same cache.
+### Volume inventory cache
+
+**Directory targets** persist a **volume-level** file index under `cache/volumes/<volume-uuid>/_root/`. Paths in the cache are stored **relative to the volume mount point** (for example `Program Files/Dell/SupportAssist/...`), not as absolute paths like `/Volumes/Windows/...`. The cache key is the mounted volume's UUID from `diskutil` (for example `60EEB5B4-521D-432F-9FE7-D0945E33B7FD`), so the same physical volume reuses the same cache even when macOS mounts it at a different path (such as `/Volumes/bitlocker` vs `/Volumes/Windows`).
+
+Kirby walks the mount point once (or indexes a subdirectory when no mount-level cache exists yet), stores paths in the UUID cache, then filters to the current `-t` scope when publishing `tmp/<name>/all_files`. Scanning `/Volumes/Windows/Program Files/Dell` in one run and the same directory again in a later run reuses the cached index instead of re-walking the tree.
+
+The cache survives across Kirby invocations and namespaces. Pass `--clear-cache` with `-t` to delete the UUID cache (and any legacy mount-path cache) for that volume before indexing:
+
+```bash
+python kirby.py -t /Volumes/Windows -n laptop_ssd --clear-cache -e yara
+```
+
+Limited `-top` runs publish only the first N scoped paths to `tmp/<name>/` and do not overwrite the shared volume cache under `cache/volumes/`. A subsequent run **without** `-top` republishes the full scoped inventory automatically (limited publishes are recorded in `tmp/all_files.meta` as `publish_limit`).
+
+Use `-find REGEX` to grep cached inventories without running scan modules. With `-n laptop_ssd` alone, Kirby searches `tmp/laptop_ssd/all_files` and every volume cache under `cache/volumes/`. Add `-t /Volumes/Windows` to limit the search to caches for that volume. Simple glob wildcards work (`*PDF Fixers*.exe`).
+
+```bash
+python kirby.py -n laptop_ssd -find '*PDF Fixers*.exe'
+python kirby.py -t /Volumes/Windows -find 'Program Files/.+/setup\.exe'
+```
 
 **Single-file targets** skip volume indexing: Kirby hashes the file and writes one line to `tmp/<name>/all_files`. The fingerprint in `all_files.meta` tracks path, size, and modification time.
 
@@ -272,12 +328,12 @@ Malicious macro detection using [oletools](https://github.com/decalage2/oletools
 
 ### RegRipper
 
-Windows registry persistence analysis using [RegRipper 3.0](https://github.com/keydet89/RegRipper3.0).
+Windows registry persistence analysis using [RegRipper 4.0](https://github.com/keydet89/RegRipper4.0).
 
 **What it does**
 
-- Clones RegRipper on first run (if not already present under `modules/scan/regripper/RegRipper3.0/`)
-- Builds a local Perl environment with `Parse::Win32Registry` and RegRipper's patched modules (`setup.sh`)
+- Clones RegRipper on first run (if not already present under `modules/scan/regripper/RegRipper4.0/`)
+- Builds a local Perl environment with `Parse::Win32Registry` (`setup.sh`)
 - Locates `SYSTEM`, `SOFTWARE`, and user-profile `NTUSER.DAT` hives on the mounted target volume
 - Runs targeted RegRipper plugins for run keys, services, Winlogon, UserAssist, and AppCompatCache
 - Summarizes suspect entries (RegRipper alerts plus launcher/path heuristics) in a Markdown report
@@ -304,7 +360,7 @@ Windows registry persistence analysis using [RegRipper 3.0](https://github.com/k
 | `categories`         | Comma-separated persistence categories to analyze     |
 
 
-**Prerequisites:** `perl` and `cpan` on `PATH` (system Perl on macOS is sufficient). First run executes `setup.sh` to install Perl dependencies locally under `modules/scan/regripper/perl-lib/`.
+**Prerequisites:** `perl` and `cpan` on `PATH` (system Perl on macOS is sufficient). First run executes `setup.sh` to install Perl dependencies locally under `modules/scan/regripper/perl-lib/`. After `source .venv/bin/activate`, `rip.pl` and `rr.pl` are on `PATH` via `bin/` (see `venv-paths.sh`).
 
 ---
 
@@ -479,15 +535,15 @@ Looks up SHA256 hashes for files flagged by scan modules and retrieves enrichmen
 
 ### signatures
 
-Code signature verification for flagged executables using `codesign`, `osslsigncode`, `exiftool`, and `strings`.
+Code signature verification for flagged executables using platform-appropriate tools: `osslsigncode` for Windows PE files, `codesign` for macOS binaries, plus `exiftool` and `strings` on verification failure.
 
 **What it does**
 
 - Reads flagged paths from `tmp/<name>/flagged.csv` (or the scoped list when `-t` is provided)
 - Filters to configured executable-like extensions (`.exe`, `.dll`, `.sys`, etc.)
-- On macOS, runs `codesign -dv --verbose=4` and `codesign --verify --strict --verbose=2`
-- On Windows PE files, runs `osslsigncode verify` when available
-- Collects Authenticode and PE metadata via `exiftool`; dumps leading strings on verification failure
+- **Windows PE** (`.exe`, `.dll`, … or `MZ` header): runs `osslsigncode verify` only
+- **macOS binaries** (Mach-O, `.dylib`, bundle executables): runs `codesign --verify` and `codesign -dv` only
+- Collects metadata via `exiftool`; dumps leading strings when verification fails
 
 **Output**
 
@@ -508,6 +564,62 @@ Code signature verification for flagged executables using `codesign`, `osslsignc
 
 
 **Prerequisites:** `codesign` (macOS), optional `osslsigncode` (`brew install osslsigncode`), `exiftool`, and `strings` on `PATH`.
+
+---
+
+### sleuthkit-ntfs
+
+NTFS filesystem-level analysis using locally built Sleuth Kit tools (`mmls`, `fsstat`, `fls`, `ifind`, `istat`). Inspects MFT metadata for timestomping, alternate data streams, hidden files, reparse points, and suspicious executables in high-risk paths.
+
+**What it does**
+
+- **Volume** (`-t` is a block device, disk image, or mount-point root such as `/Volumes/Windows`): runs `mmls` and `fsstat`, then `fls` on configured paths (`/Users`, `/Windows/System32`, etc.) and flags executables under suspicious locations
+- **Directory** (`-t` is a folder under a mounted NTFS volume): walks files (up to `max_directory_files`) and runs `ifind` + `istat` on each MFT entry
+- **File** (`-t` is a single file under a mounted NTFS volume): full `ifind` + `istat` analysis of that MFT entry
+
+Device resolution follows the same rules as `sleuthkit-mactime`: infer the block device from the mount point (including dislocker-backed mounts), fall back to `TARGET_DEVICE` in `sleuthkit.conf`, or use `-t` directly when it is already a device or image. Set `prefer_config_device = true` in `sleuthkit-ntfs.conf` to prefer `TARGET_DEVICE` over mount inference for volume scans.
+
+**Output**
+
+- `output/<name>/sleuthkit-ntfs.md` — append-only report; each run adds a new section unless an identical analysis (same target and findings fingerprint) is already recorded
+
+**Flagged files**
+
+- Does not read or write `tmp/<name>/flagged.csv`
+
+**Configuration**
+
+Module settings (`modules/scan/sleuthkit-ntfs/sleuthkit-ntfs.conf`):
+
+| Option | Description |
+| --- | --- |
+| `sleuthkit_prefix` | Local Sleuth Kit install prefix (default: `modules/analysis/sleuthkit-mactime/install`) |
+| `prefer_config_device` | Prefer `TARGET_DEVICE` from `sleuthkit.conf` over mount-inferred device |
+| `volume_scan_paths` | NTFS paths to sample during volume-level scans |
+| `suspicious_path_patterns` | Path substrings that suggest malware staging when paired with executable extensions |
+| `executable_extensions` | Extensions treated as executable in `fls` heuristics |
+| `max_directory_files` | Maximum files to analyze for directory targets (`0` = unlimited) |
+| `timestomp_seconds_threshold` | Minimum SI vs FN modified-time delta (seconds) to flag timestomping |
+
+Device and BitLocker credentials are read from `modules/analysis/sleuthkit-mactime/sleuthkit.conf` (same as `sleuthkit-mactime`).
+
+**Prerequisites:** Build Sleuth Kit locally (`./modules/analysis/sleuthkit-mactime/build_sleuthkit.sh`). Requires `sudo` when reading raw block devices.
+
+**Usage**
+
+```bash
+# Volume-level scan via mount point (no file inventory built)
+.venv/bin/python kirby.py -t /Volumes/Windows -n laptop_ssd -e sleuthkit-ntfs
+
+# Directory walk
+.venv/bin/python kirby.py -t /Volumes/Windows/Users/riley/Downloads -n laptop_ssd -e sleuthkit-ntfs
+
+# Single-file MFT analysis
+.venv/bin/python kirby.py -t /Volumes/Windows/Users/riley/Downloads/file.exe -n laptop_ssd -e sleuthkit-ntfs
+
+# Raw device or image
+.venv/bin/python kirby.py -t /dev/disk5s3 -n laptop_ssd -e sleuthkit-ntfs
+```
 
 ---
 
@@ -660,6 +772,7 @@ python kirby.py -t /Volumes/Windows -n laptop_ssd -r simple-rescue
 | `tmp/<name>/virustotal-hashes`            | SHA256 hashes of flagged files analyzed by VirusTotal                  |
 | `output/<name>/clamdscan.log`             | Full ClamAV clamdscan transcript                                       |
 | `cache/virustotal-cache.db`               | VirusTotal API response cache                                          |
+| `output/<name>/sleuthkit-ntfs.md`        | NTFS filesystem-level analysis from Sleuth Kit (append-only)           |
 | `output/<name>/sleuthkit-mactime.md`      | MAC-time timeline from Sleuth Kit                                      |
 
 
@@ -680,10 +793,13 @@ Set `BITLOCKER_RECOVERY_PASSWORD` before running the mount script. The decrypted
 ### Python
 
 ```bash
-python3 -m venv .venv
+./setup-venv.sh
 source .venv/bin/activate
-pip install -r requirements.txt
 ```
+
+`setup-venv.sh` creates `.venv`, installs Python dependencies, and hooks `activate` to source `venv-paths.sh` at the project root. That adds `bin/` to `PATH`, exposing RegRipper wrappers such as `rip.pl` and `rr.pl` (with the local Perl module path configured automatically).
+
+To hook an existing virtual environment without recreating it, re-run `./setup-venv.sh` or append the `venv-paths.sh` block from that script to `.venv/bin/activate`.
 
 ### Per-module external tools
 
@@ -698,6 +814,7 @@ pip install -r requirements.txt
 | clamav            | Scan     | `clamav`, `freshclam`; Kirby uses `modules/scan/clamav/clamd.conf` |
 | VirusTotal        | Analysis | VirusTotal API key in `.env`                                       |
 | signatures        | Analysis | `codesign`, optional `osslsigncode`, `exiftool`, `strings`         |
+| sleuthkit-ntfs    | Scan     | Local Sleuth Kit build; `sudo` for raw device access               |
 | sleuthkit-mactime | Analysis | Local Sleuth Kit build; `sudo` for raw device access               |
 | simple-rescue     | Rescue   | mraptor / oletools (via pip)                                       |
 
@@ -721,6 +838,7 @@ modules/
     regripper/        # Windows registry persistence analysis
     detect-it-easy/   # Detect It Easy packer/protector scanning
     clamav/           # ClamAV clamdscan integration
+    sleuthkit-ntfs/   # NTFS MFT filesystem-level analysis via Sleuth Kit
   analysis/
     virustotal/       # VirusTotal hash enrichment
     signatures/       # PE / Authenticode signature verification
@@ -729,6 +847,6 @@ modules/
     simple-rescue/    # Copy user documents after mraptor macro checks
 output/               # Markdown reports (one subdirectory per target run)
 tmp/                  # Per-target working files (tmp/<name>/)
-cache/                # Volume inventory and VirusTotal API cache
+cache/                # Volume inventory (by UUID) and VirusTotal API cache
 ```
 

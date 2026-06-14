@@ -6,6 +6,7 @@ import configparser
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -16,8 +17,12 @@ from kirby_flagged import record_flagged
 from kirby_kext import is_kext_target, kext_search_roots
 from kirby_log import KirbyLogger
 from kirby_report import format_scan_report_header
+from kirby_file_list import read_scan_paths, uses_explicit_file_list
+from kirby_target import resolve_flagged_filter_root
+from kirby_tool_errors import check_subprocess, serious_stderr_lines
 
 TOOL_NAME = "yara"
+SCAN_BATCH_SIZE = 250
 
 MODULE_DIR = Path(__file__).resolve().parent
 COMPILED_RULES_NAME = "kirby-compiled.yarc"
@@ -147,49 +152,202 @@ def ensure_compiled_rules(
     return compiled, len(rule_files)
 
 
-def run_yara(
-    compiled: Path,
-    target: Path,
-    recursive: bool,
-    log: KirbyLogger,
-) -> subprocess.CompletedProcess[str]:
+def yara_binary() -> str:
     yara = shutil.which("yara")
     if yara is None:
         raise RuntimeError("yara not found; install YARA (e.g. brew install yara)")
+    return yara
 
-    command = [yara, "-C", str(compiled)]
+
+def read_file_list(path: Path, log: KirbyLogger) -> list[Path]:
+    if not path.is_file():
+        raise FileNotFoundError(f"File list not found: {path}")
+
+    log.step(f"Reading file inventory from {path}")
+    files = [Path(entry.strip()) for entry in path.read_text(encoding="utf-8").splitlines() if entry.strip()]
+    log.step(f"Loaded {len(files)} paths from inventory")
+    return files
+
+
+def is_under_target(path: Path, target_root: Path) -> bool:
+    try:
+        resolved_path = path.resolve(strict=False)
+        resolved_target = target_root.resolve(strict=False)
+        if resolved_target.is_file():
+            return resolved_path == resolved_target
+        return resolved_path == resolved_target or resolved_path.is_relative_to(resolved_target)
+    except (OSError, ValueError):
+        return False
+
+
+def filter_files_for_target(
+    files: list[Path],
+    target: Path,
+    *,
+    recursive: bool,
+) -> list[Path]:
+    target_root = resolve_flagged_filter_root(target)
+    filtered: list[Path] = []
+
+    for path in files:
+        if not path.is_file():
+            continue
+        if not is_under_target(path, target_root):
+            continue
+        if not recursive and path.parent.resolve(strict=False) != target_root.resolve(strict=False):
+            continue
+        filtered.append(path)
+
+    filtered.sort(key=lambda item: str(item).lower())
+    return filtered
+
+
+def walk_target_files(target: Path, *, recursive: bool) -> list[Path]:
+    if target.is_file():
+        return [target.resolve(strict=False)]
+
+    if not target.is_dir():
+        return []
+
     if recursive:
-        command.append("-r")
-    command.append(str(target))
+        files = [path for path in target.rglob("*") if path.is_file()]
+    else:
+        files = [path for path in target.iterdir() if path.is_file()]
 
-    log.step(f"Running: {' '.join(command)}")
-    log.step("Scanning target (this may take a while)")
-    return subprocess.run(command, capture_output=True, text=True, check=False)
+    files.sort(key=lambda item: str(item).lower())
+    return files
+
+
+def collect_scan_files(
+    target: Path,
+    *,
+    recursive: bool,
+    file_list: Path | None,
+    log: KirbyLogger,
+) -> list[Path]:
+    if uses_explicit_file_list(target, file_list):
+        files = [path for path in read_scan_paths(target, log) if path.is_file()]
+        files.sort(key=lambda item: str(item).lower())
+        log.step(f"Selected {len(files)} file(s) from explicit file list")
+        return files
+
+    if file_list is not None and file_list.is_file() and not is_kext_target(target):
+        files = filter_files_for_target(read_file_list(file_list, log), target, recursive=recursive)
+        log.step(f"Selected {len(files)} file(s) from inventory for scanning")
+        return files
+
+    files = walk_target_files(target, recursive=recursive)
+    log.step(f"Collected {len(files)} file(s) for scanning")
+    return files
+
+
+def collect_kext_scan_files(*, recursive: bool, log: KirbyLogger) -> list[Path]:
+    roots = kext_search_roots()
+    if not roots:
+        raise RuntimeError("No kernel extension directories found on this system")
+
+    files: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        for path in walk_target_files(root, recursive=recursive):
+            key = str(path.resolve(strict=False)).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(path)
+
+    files.sort(key=lambda item: str(item).lower())
+    log.step(f"Collected {len(files)} kernel extension file(s) for scanning")
+    return files
+
+
+def run_yara_batch(
+    yara: str,
+    compiled: Path,
+    files: list[Path],
+) -> subprocess.CompletedProcess[str]:
+    # YARA 4.5+ treats extra positional args after -C as rules files, not scan
+    # targets. Pass batches via --scan-list instead.
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as handle:
+        for path in files:
+            handle.write(f"{path}\n")
+        scan_list = Path(handle.name)
+
+    try:
+        return subprocess.run(
+            [yara, "-C", str(compiled), "--scan-list", str(scan_list)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        scan_list.unlink(missing_ok=True)
+
+
+def run_yara_on_files(
+    compiled: Path,
+    files: list[Path],
+    log: KirbyLogger,
+    *,
+    desc: str = "Scanning files",
+    force_errors: bool = False,
+) -> tuple[list[tuple[str, str]], str]:
+    if not files:
+        log.step("No files to scan")
+        return [], ""
+
+    yara = yara_binary()
+    matches: list[tuple[str, str]] = []
+    stderr_parts: list[str] = []
+    batch: list[Path] = []
+    allowed_returncodes = frozenset({0, 1})
+
+    def process_batch(current_batch: list[Path]) -> None:
+        result = run_yara_batch(yara, compiled, current_batch)
+        if not check_subprocess(
+            result,
+            context="yara scan failed",
+            allowed_returncodes=allowed_returncodes,
+            force_errors=force_errors,
+            warnings=stderr_parts,
+        ):
+            return
+        matches.extend(parse_matches(result.stdout))
+        stderr = (result.stderr or "").strip()
+        if stderr and not serious_stderr_lines(stderr):
+            stderr_parts.append(stderr)
+
+    for filepath in log.progress(files, total=len(files), desc=desc, unit="file"):
+        batch.append(filepath)
+        if len(batch) < SCAN_BATCH_SIZE:
+            continue
+
+        process_batch(batch)
+        batch = []
+
+    if batch:
+        process_batch(batch)
+
+    return matches, "\n\n".join(stderr_parts)
 
 
 def run_yara_kext(
     compiled: Path,
     recursive: bool,
     log: KirbyLogger,
+    *,
+    force_errors: bool = False,
 ) -> tuple[list[tuple[str, str]], str, int]:
-    roots = kext_search_roots()
-    if not roots:
-        raise RuntimeError("No kernel extension directories found on this system")
-
-    matches: list[tuple[str, str]] = []
-    stderr_parts: list[str] = []
-    worst_returncode = 0
-
-    for root in roots:
-        result = run_yara(compiled, root, recursive, log)
-        if result.returncode not in (0, 1):
-            raise RuntimeError(result.stderr.strip() or f"yara exited with code {result.returncode}")
-        worst_returncode = max(worst_returncode, result.returncode)
-        matches.extend(parse_matches(result.stdout))
-        if result.stderr.strip():
-            stderr_parts.append(result.stderr.strip())
-
-    return matches, "\n\n".join(stderr_parts), worst_returncode
+    files = collect_kext_scan_files(recursive=recursive, log=log)
+    matches, stderr = run_yara_on_files(
+        compiled,
+        files,
+        log,
+        desc="Scanning kext files",
+        force_errors=force_errors,
+    )
+    returncode = 1 if matches else 0
+    return matches, stderr, returncode
 
 
 def parse_matches(stdout: str) -> list[tuple[str, str]]:
@@ -264,6 +422,7 @@ def run(
     flagged_csv: Path | None = None,
     file_list: Path | None = None,
     include_kext: bool = False,
+    force_errors: bool = False,
 ) -> None:
     log = KirbyLogger(verbose, prefix="yara")
     log.step(f"Loading config from {config}")
@@ -279,29 +438,35 @@ def run(
 
     if is_kext_target(target):
         log.step("Scanning kernel extension directories")
-        kext_matches, kext_stderr, _returncode = run_yara_kext(compiled, recursive, log)
+        kext_matches, kext_stderr, _returncode = run_yara_kext(
+            compiled, recursive, log, force_errors=force_errors
+        )
         matches.extend(kext_matches)
         if kext_stderr.strip():
             stderr_parts.append(kext_stderr.strip())
-    elif target.is_file():
-        log.step("Scanning single file target")
-        result = run_yara(compiled, target, recursive=False, log=log)
-        if result.returncode not in (0, 1):
-            raise RuntimeError(result.stderr.strip() or f"yara exited with code {result.returncode}")
-        matches.extend(parse_matches(result.stdout))
-        if result.stderr.strip():
-            stderr_parts.append(result.stderr.strip())
     else:
-        result = run_yara(compiled, target, recursive, log)
-        if result.returncode not in (0, 1):
-            raise RuntimeError(result.stderr.strip() or f"yara exited with code {result.returncode}")
-        matches.extend(parse_matches(result.stdout))
-        if result.stderr.strip():
-            stderr_parts.append(result.stderr.strip())
+        scan_files = collect_scan_files(
+            target,
+            recursive=recursive,
+            file_list=file_list,
+            log=log,
+        )
+        target_matches, target_stderr = run_yara_on_files(
+            compiled,
+            scan_files,
+            log,
+            desc="Scanning files",
+            force_errors=force_errors,
+        )
+        matches.extend(target_matches)
+        if target_stderr.strip():
+            stderr_parts.append(target_stderr.strip())
 
     if include_kext and not is_kext_target(target):
         log.step("Also scanning kernel extension directories")
-        kext_matches, kext_stderr, _returncode = run_yara_kext(compiled, recursive, log)
+        kext_matches, kext_stderr, _returncode = run_yara_kext(
+            compiled, recursive, log, force_errors=force_errors
+        )
         matches.extend(kext_matches)
         if kext_stderr.strip():
             stderr_parts.append(kext_stderr.strip())
